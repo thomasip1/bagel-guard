@@ -625,6 +625,17 @@ if let flag = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.argu
     exit(0)
 }
 
+// `BagelGuard --camera-probe` logs per-frame brightness and the exposure flag for 3 s, covering the
+// screen with the dark overlay tint for the second half, then exits. For tuning when the photo is taken.
+if CommandLine.arguments.contains("--camera-probe") {
+    CameraProbe.run()
+    exit(0)
+}
+if CommandLine.arguments.contains("--snap-test") {
+    CameraProbe.snapTest()
+    exit(0)
+}
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

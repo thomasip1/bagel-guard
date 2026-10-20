@@ -101,16 +101,14 @@ final class MugshotCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     private let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "com.thomasip.bagelguard.camera")
-    private var device: AVCaptureDevice?
     private var completion: ((Mugshot?) -> Void)?
-    private var startedAt = Date()
+    private var firstFrameAt: Date?  // only touched on `queue`
     private var grabbed = false  // only touched on `queue`
 
     func snap(_ completion: @escaping (Mugshot?) -> Void) {
         guard Self.isAuthorized, let device = AVCaptureDevice.default(for: .video),
             let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input)
         else { return completion(nil) }
-        self.device = device
         session.sessionPreset = .high
         session.addInput(input)
         let output = AVCaptureVideoDataOutput()
@@ -119,10 +117,7 @@ final class MugshotCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard session.canAddOutput(output) else { return completion(nil) }
         session.addOutput(output)
         self.completion = completion
-        queue.async { [self] in
-            startedAt = Date()
-            session.startRunning()
-        }
+        queue.async { [session] in session.startRunning() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.deliver(nil) }
     }
 
@@ -133,14 +128,21 @@ final class MugshotCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard !grabbed, let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        // The first frames come out dark while auto-exposure catches up. Take the first frame after
-        // it settles, and never wait longer than about a second.
-        let elapsed = Date().timeIntervalSince(startedAt)
-        guard elapsed > 1.1 || (elapsed > 0.25 && device?.isAdjustingExposure == false) else { return }
+        // The MacBook camera's first frame is nearly black and exposure keeps rising for a while
+        // after it (isAdjustingExposure always reads false, so it can't be trusted). Measured: first
+        // frame ~0.75 s after start at brightness 8/255, ~76 by 0.45 s later, ~83 after 3 s.
+        let now = Date()
+        if firstFrameAt == nil { firstFrameAt = now }
+        guard now.timeIntervalSince(firstFrameAt!) >= 0.45 else { return }
         grabbed = true
-        // Cool, low-saturation sensor look.
-        let image = CIImage(cvPixelBuffer: buffer)
-            .applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0.15, kCIInputContrastKey: 1.1])
+        // Even out what exposure hasn't caught up on, then the cool, low-saturation sensor look.
+        var image = CIImage(cvPixelBuffer: buffer)
+        for filter in image.autoAdjustmentFilters(options: [.redEye: false]) {
+            filter.setValue(image, forKey: kCIInputImageKey)
+            image = filter.outputImage ?? image
+        }
+        image = image
+            .applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0.2])
             .applyingFilter("CITemperatureAndTint", parameters: ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 7600, y: 0)])
         guard let cgImage = CIContext().createCGImage(image, from: image.extent) else {
             return DispatchQueue.main.async { self.deliver(nil) }
