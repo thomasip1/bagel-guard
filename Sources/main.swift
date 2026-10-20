@@ -176,8 +176,8 @@ enum Observation {
 enum Detector {
     static let shortcode = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bagel", options: [.caseInsensitive])
     static let word = try! NSRegularExpression(pattern: "bagel", options: [.caseInsensitive])
-    /// `:bag`, `:hotbag`, or the word's start, "bage" (plain "bag" is too common).
-    static let partial = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bag|bage", options: [.caseInsensitive])
+    /// `:bag`, `:hotbag`, or a word starting "bage" (plain "bag" is too common, and "garbage" isn't one).
+    static let partial = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bag|\\bbage", options: [.caseInsensitive])
 
     /// Looks at Slack's focused field. Message boxes (text areas) count the emoji, its shortcode, the
     /// word and converted emoji images. Other fields, such as search, count only the emoji and
@@ -236,8 +236,9 @@ final class SlackWatcher {
     private var observer: AXObserver?
     private var pollTimer: Timer?
     private var checkScheduled = false
-    /// The bagel last reported, so each attempt is reported once rather than on every check.
+    /// The last report, so each attempt (or approach) is reported once rather than on every check.
     private var reported: Hit?
+    private var reportedApproach = false
     var onHit: ((Hit, String) -> Void)?
     var onApproach: (() -> Void)?
 
@@ -341,15 +342,18 @@ final class SlackWatcher {
 
     func check(source: String) {
         guard Settings.armed else { return }
-        switch observeFocused() {
-        case .bagel(let hit):
+        let observation = observeFocused()
+        if case .approaching = observation {
+            if !reportedApproach { onApproach?() }
+            reportedApproach = true
+        } else {
+            reportedApproach = false
+        }
+        if case .bagel(let hit) = observation {
             guard hit != reported else { return }
             reported = hit
             onHit?(hit, source)
-        case .approaching:
-            reported = nil
-            onApproach?()
-        case .clean:
+        } else {
             reported = nil
         }
     }
@@ -396,7 +400,7 @@ final class SendInterceptor {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return pass
         }
-        guard Settings.armed, let slackPid = watcher.pid else { return pass }
+        guard Settings.armed, Settings.action != .log, let slackPid = watcher.pid else { return pass }
 
         if type == .keyDown {
             let key = Int(event.getIntegerValueField(.keyboardEventKeycode))

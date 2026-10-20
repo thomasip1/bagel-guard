@@ -29,9 +29,14 @@ struct Booking {
             ending: ending)
     }
 
-    /// Slack labels the message box "Message to <channel or person>".
+    /// Slack labels the message box "Message to <channel or person>", or "Reply to thread in
+    /// <channel>" in a thread.
     static func destination(fromField field: String) -> String {
-        let name = field.replacingOccurrences(of: "Message to ", with: "").trimmingCharacters(in: .whitespaces)
+        var name = field
+        for prefix in ["Message to ", "Reply to thread in "] where name.hasPrefix(prefix) {
+            name = String(name.dropFirst(prefix.count))
+        }
+        name = name.trimmingCharacters(in: .whitespaces)
         if name.isEmpty { return "Slack" }
         // Channel names have no spaces; people's names usually do.
         return name.contains(" ") ? name : "#\(name)"
@@ -189,9 +194,14 @@ final class MugshotCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             output.setSampleBufferDelegate(self, queue: queue)
             session.beginConfiguration()
             session.sessionPreset = .high
-            if session.canAddInput(input) { session.addInput(input) }
-            if session.canAddOutput(output) { session.addOutput(output) }
+            let ready = session.canAddInput(input) && session.canAddOutput(output)
+            if ready {
+                session.addInput(input)
+                session.addOutput(output)
+            }
             session.commitConfiguration()
+            // e.g. the camera is held by another app: say so now rather than after the timeout.
+            guard ready else { return DispatchQueue.main.async { self.deliver(nil) } }
             session.startRunning()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.deliver(nil) }
