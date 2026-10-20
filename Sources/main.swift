@@ -1,8 +1,9 @@
 // BagelGuard: blocks the "bagel on an unlocked laptop" prank in Slack.
 //
-// Needs only the Accessibility permission. It watches Slack's focused message box through the
-// accessibility API, swallows Return / clicks on Send while a bagel is in it, then clears the box,
-// shows an overlay and (optionally) locks the screen.
+// Watches Slack's focused message box through the accessibility API. When a bagel shows up (the
+// emoji, its shortcode or the word), it clears the box, covers every screen with an overlay showing
+// a webcam photo of whoever is at the keyboard, saves it, and locks the screen when clicked.
+// Needs the Accessibility permission, plus Camera for the photo.
 
 import ApplicationServices
 import Carbon.HIToolbox
@@ -27,59 +28,75 @@ enum Action: String, CaseIterable {
         case .log: return "Only log it"
         }
     }
+
+    var showsOverlay: Bool { self == .overlayThenLock || self == .overlay }
 }
 
 enum Settings {
     static let defaults = UserDefaults.standard
 
+    static func register() {
+        defaults.register(defaults: ["armed": true, "mugshot": true, "action": Action.overlayThenLock.rawValue])
+    }
+
     static var armed: Bool {
-        get { defaults.object(forKey: "armed") as? Bool ?? true }
+        get { defaults.bool(forKey: "armed") }
         set { defaults.set(newValue, forKey: "armed") }
     }
 
-    /// `defaults write com.thomasip.bagelguard debug -bool true` logs every Return pressed in Slack.
-    static var debug: Bool { defaults.bool(forKey: "debug") }
-
     /// Whether the overlay takes a webcam photo of whoever tried.
     static var mugshot: Bool {
-        get { defaults.object(forKey: "mugshot") as? Bool ?? true }
+        get { defaults.bool(forKey: "mugshot") }
         set { defaults.set(newValue, forKey: "mugshot") }
-    }
-
-    /// Counts caught attempts; shown as the case number on the placard.
-    static func nextCaseNumber() -> Int {
-        let next = defaults.integer(forKey: "caseCount") + 1
-        defaults.set(next, forKey: "caseCount")
-        return next
     }
 
     static var action: Action {
         get { Action(rawValue: defaults.string(forKey: "action") ?? "") ?? .overlayThenLock }
         set { defaults.set(newValue.rawValue, forKey: "action") }
     }
+
+    /// Counts caught attempts; shown as the case number on the overlay.
+    static func nextCaseNumber() -> Int {
+        let next = defaults.integer(forKey: "caseCount") + 1
+        defaults.set(next, forKey: "caseCount")
+        return next
+    }
 }
 
 // MARK: - Logging
 
 enum Log {
-    static let url = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Logs/BagelGuard.log")
-    static let formatter = ISO8601DateFormatter()
-
-    static func write(_ message: String) {
-        let line = "\(formatter.string(from: Date())) \(message)\n"
-        FileHandle.standardError.write(line.data(using: .utf8)!)
+    static let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/BagelGuard.log")
+    private static let formatter = ISO8601DateFormatter()
+    private static let queue = DispatchQueue(label: "com.thomasip.bagelguard.log")
+    private static let file: FileHandle? = {
         if !FileManager.default.fileExists(atPath: url.path) {
             FileManager.default.createFile(atPath: url.path, contents: nil)
         }
-        guard let handle = try? FileHandle(forWritingTo: url) else { return }
-        handle.seekToEndOfFile()
-        handle.write(line.data(using: .utf8)!)
-        try? handle.close()
+        let handle = try? FileHandle(forWritingTo: url)
+        handle?.seekToEndOfFile()
+        return handle
+    }()
+
+    static func write(_ message: String) {
+        let line = Data("\(formatter.string(from: Date())) \(message)\n".utf8)
+        queue.async {
+            FileHandle.standardError.write(line)
+            file?.write(line)
+        }
     }
 }
 
 // MARK: - Accessibility helpers
+
+/// Caps accessibility calls, so a hung app can't stall the event tap. Clicks hit-test whatever app
+/// is under the pointer, so that cap is tight; Slack's own calls get more room.
+let systemWide: AXUIElement = {
+    let element = AXUIElementCreateSystemWide()
+    AXUIElementSetMessagingTimeout(element, 0.25)
+    return element
+}()
+let slackTimeout: Float = 1
 
 func axAttr<T>(_ element: AXUIElement, _ name: String) -> T? {
     var value: CFTypeRef?
@@ -99,92 +116,115 @@ func axChildren(_ element: AXUIElement) -> [AXUIElement] {
     axAttr(element, kAXChildrenAttribute) ?? []
 }
 
+/// The element and up to `limit - 1` of its ancestors, nearest first.
+func axAncestors(_ element: AXUIElement, limit: Int) -> some Sequence<AXUIElement> {
+    sequence(first: element) { axElement($0, kAXParentAttribute) }.prefix(limit)
+}
+
+/// What the element says about itself: its description, or else its title.
+func axLabel(_ element: AXUIElement) -> String {
+    let description: String = axAttr(element, kAXDescriptionAttribute) ?? ""
+    return description.isEmpty ? axAttr(element, kAXTitleAttribute) ?? "" : description
+}
+
 // MARK: - Detection
 
-struct Hit {
-    let reason: String
+/// What was found in the message box.
+enum Evidence: Equatable, CustomStringConvertible {
+    /// The 🥯 character, typed or pasted, before Slack turns it into an image.
+    case character
+    /// A shortcode, finished or not: `:bagel`, `:hotbagel:`.
+    case shortcode(String)
+    /// The word itself: "bagel", "Bagels".
+    case word(String)
+    /// A converted emoji: Slack's image label, e.g. "bagel pet emoji".
+    case emoji(String)
+
+    var description: String {
+        switch self {
+        case .character: return "unicode 🥯"
+        case .shortcode(let text): return "shortcode \(text)"
+        case .word(let text): return "text \"\(text)\""
+        case .emoji(let label): return "emoji image \"\(label)\""
+        }
+    }
+
+    /// How the overlay names it.
+    var displayName: String {
+        switch self {
+        case .character: return "🥯 U+1F96F"
+        case .shortcode(let text): return "\(text) shortcode"
+        case .word(let text): return "the word \"\(text)\""
+        case .emoji(let label): return label
+        }
+    }
+}
+
+struct Hit: Equatable {
+    let evidence: Evidence
+    /// The message box's label, e.g. "Message to office-london".
     let field: String
 }
 
+enum Observation {
+    case bagel(Hit)
+    /// A bagel shortcode or word is being typed; used to power the camera up early.
+    case approaching
+    case clean
+}
+
 enum Detector {
-    /// An in-progress or finished shortcode such as `:bagel`, `:hotbagel:`, `:bagel-party-parrot:`.
     static let shortcode = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bagel", options: [.caseInsensitive])
+    static let word = try! NSRegularExpression(pattern: "bagel", options: [.caseInsensitive])
+    /// `:bag`, `:hotbag`, or the word's start, "bage" (plain "bag" is too common).
+    static let partial = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bag|bage", options: [.caseInsensitive])
 
-    /// A bagel on its way: a shortcode like `:bag` or `:hotbag`, or the word's start, "bage" (plain
-    /// "bag" is too common). Used to power the camera up early.
-    static let partialShortcode = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bag|bage", options: [.caseInsensitive])
-
-    static func isTypingBagel(focused: AXUIElement) -> Bool {
-        var node: AXUIElement? = focused
-        for _ in 0..<6 {
-            guard let current = node else { break }
-            if (axAttr(current, kAXRoleAttribute) as String?) == kAXTextAreaRole {
-                let value: String = axAttr(current, kAXValueAttribute) ?? ""
-                return partialShortcode.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
+    /// Looks at Slack's focused field. Message boxes (text areas) count the emoji, its shortcode, the
+    /// word and converted emoji images. Other fields, such as search, count only the emoji and
+    /// shortcodes, so searching Slack for "bagel" doesn't lock the Mac. Reactions are left alone.
+    static func observe(focused: AXUIElement) -> Observation {
+        // The focused node can be a text run inside the box; walk up to the field.
+        for node in axAncestors(focused, limit: 6) {
+            let role: String? = axAttr(node, kAXRoleAttribute)
+            guard role == kAXTextAreaRole || role == kAXTextFieldRole || role == kAXComboBoxRole else { continue }
+            let value: String = axAttr(node, kAXValueAttribute) ?? ""
+            let isMessageBox = role == kAXTextAreaRole
+            if let evidence = scan(value, plainText: isMessageBox) ?? (isMessageBox ? scanImages(in: node) : nil) {
+                return .bagel(Hit(evidence: evidence, field: axLabel(node)))
             }
-            node = axElement(current, kAXParentAttribute)
+            return isMessageBox && first(partial, in: value) != nil ? .approaching : .clean
         }
-        return false
+        return .clean
     }
 
-    /// The word itself, in any case and form: "bagel", "Bagels", "BAGEL TIME".
-    static let word = try! NSRegularExpression(pattern: "bagel", options: [.caseInsensitive])
-
-    /// `plainText` also catches the word; only message boxes use it, so searching Slack for
-    /// "bagel" doesn't lock the Mac.
-    static func scan(text: String, plainText: Bool = false) -> String? {
-        if text.contains("\u{1F96F}") { return "unicode 🥯" }
-        let range = NSRange(text.startIndex..., in: text)
-        if let match = shortcode.firstMatch(in: text, range: range), let r = Range(match.range, in: text) {
-            return "shortcode \(text[r])"
-        }
-        if plainText, let match = word.firstMatch(in: text, range: range), let r = Range(match.range, in: text) {
-            return "text \"\(text[r])\""
-        }
+    static func scan(_ text: String, plainText: Bool) -> Evidence? {
+        if text.contains("\u{1F96F}") { return .character }
+        if let match = first(shortcode, in: text) { return .shortcode(match) }
+        if plainText, let match = first(word, in: text) { return .word(match) }
         return nil
     }
 
-    /// Slack turns a finished emoji into an image inside the message box: an AXImage whose
-    /// description is e.g. "bagel emoji" or "bagel pet emoji".
-    static func scanImages(in root: AXUIElement) -> String? {
+    /// Slack turns a finished emoji into an AXImage inside the message box, labelled e.g. "bagel
+    /// emoji" or "bagel pet emoji".
+    static func scanImages(in root: AXUIElement) -> Evidence? {
         var stack: [(AXUIElement, Int)] = [(root, 0)]
         var visited = 0
         while let (element, depth) = stack.popLast(), visited < 400 {
             visited += 1
-            let role: String? = axAttr(element, kAXRoleAttribute)
-            if role == kAXImageRole {
-                let label = [axAttr(element, kAXDescriptionAttribute) as String?, axAttr(element, kAXTitleAttribute)]
-                    .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " ")
-                if label.lowercased().contains("bagel") { return "emoji image \"\(label)\"" }
+            if (axAttr(element, kAXRoleAttribute) as String?) == kAXImageRole {
+                let label = axLabel(element)
+                if label.lowercased().contains("bagel") { return .emoji(label) }
             }
             if depth < 8 { stack.append(contentsOf: axChildren(element).map { ($0, depth + 1) }) }
         }
         return nil
     }
 
-    /// Checks the focused element of Slack: the message box and its emoji images. Reactions are
-    /// left alone: the emoji picker's search field is not checked.
-    static func check(focused: AXUIElement) -> Hit? {
-        // The focused node can be a text run inside the box; walk up to the text area.
-        var node: AXUIElement? = focused
-        for _ in 0..<6 {
-            guard let current = node else { break }
-            let role: String? = axAttr(current, kAXRoleAttribute)
-            let label: String = axAttr(current, kAXDescriptionAttribute) ?? axAttr(current, kAXTitleAttribute) ?? ""
-            let value: String = axAttr(current, kAXValueAttribute) ?? ""
-            if role == kAXTextAreaRole {
-                if let reason = scan(text: value, plainText: true) ?? scanImages(in: current) {
-                    return Hit(reason: reason, field: label)
-                }
-                return nil
-            }
-            if role == kAXTextFieldRole || role == kAXComboBoxRole {
-                if let reason = scan(text: value) { return Hit(reason: reason, field: label) }
-                return nil
-            }
-            node = axElement(current, kAXParentAttribute)
-        }
-        return nil
+    private static func first(_ regex: NSRegularExpression, in text: String) -> String? {
+        guard let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+            let range = Range(match.range, in: text)
+        else { return nil }
+        return String(text[range])
     }
 }
 
@@ -195,6 +235,9 @@ final class SlackWatcher {
     private var app: AXUIElement?
     private var observer: AXObserver?
     private var pollTimer: Timer?
+    private var checkScheduled = false
+    /// The bagel last reported, so each attempt is reported once rather than on every check.
+    private var reported: Hit?
     var onHit: ((Hit, String) -> Void)?
     var onApproach: (() -> Void)?
 
@@ -219,23 +262,21 @@ final class SlackWatcher {
         if let running = NSRunningApplication.runningApplications(withBundleIdentifier: slackBundleID).first {
             attach(running.processIdentifier)
         }
-        // AX notifications from Chromium are not guaranteed for every edit, so poll as well while
-        // Slack is in front. One focused-element read plus a small subtree walk, every 250 ms.
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            guard let self, self.slackIsFrontmost else { return }
+        // Chromium doesn't post an AX notification for every edit, so also poll while Slack is in front.
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            guard let self, let pid = self.pid, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
             self.check(source: "poll")
         }
+        timer.tolerance = 0.05
+        pollTimer = timer
     }
 
-    /// Asks the accessibility server rather than NSWorkspace: NSWorkspace's frontmost app is
-    /// updated by a notification and lags behind real focus changes.
-    /// Either source counts, so a stale answer from one of them does not let a bagel through.
+    /// Either NSWorkspace or the accessibility server counts: NSWorkspace's frontmost app updates
+    /// on a notification and can lag behind a focus change.
     var slackIsFrontmost: Bool {
         guard let pid else { return false }
         if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid { return true }
-        guard let focusedApp = axElement(AXUIElementCreateSystemWide(), kAXFocusedApplicationAttribute) else {
-            return false
-        }
+        guard let focusedApp = axElement(systemWide, kAXFocusedApplicationAttribute) else { return false }
         var focusedPid: pid_t = 0
         return AXUIElementGetPid(focusedApp, &focusedPid) == .success && focusedPid == pid
     }
@@ -244,6 +285,7 @@ final class SlackWatcher {
         detach()
         self.pid = pid
         let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, slackTimeout)
         self.app = app
         // Chromium only builds its full accessibility tree when an assistive app asks for it.
         let manual = AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
@@ -252,8 +294,7 @@ final class SlackWatcher {
         var observer: AXObserver?
         let callback: AXObserverCallback = { _, _, notification, refcon in
             guard let refcon else { return }
-            let watcher = Unmanaged<SlackWatcher>.fromOpaque(refcon).takeUnretainedValue()
-            watcher.check(source: notification as String)
+            Unmanaged<SlackWatcher>.fromOpaque(refcon).takeUnretainedValue().scheduleCheck(source: notification as String)
         }
         guard AXObserverCreate(pid, callback, &observer) == .success, let observer else {
             Log.write("AXObserverCreate failed; relying on polling")
@@ -277,19 +318,45 @@ final class SlackWatcher {
         pid = nil
     }
 
+    /// One keystroke posts several notifications; check once for all of them.
+    private func scheduleCheck(source: String) {
+        guard !checkScheduled else { return }
+        checkScheduled = true
+        DispatchQueue.main.async { [self] in
+            checkScheduled = false
+            check(source: source)
+        }
+    }
+
+    private func observeFocused() -> Observation {
+        guard let app, let focused = axElement(app, kAXFocusedUIElementAttribute) else { return .clean }
+        return Detector.observe(focused: focused)
+    }
+
     /// The bagel currently in Slack's focused field, if any.
     func currentHit() -> Hit? {
-        guard let app, let focused = axElement(app, kAXFocusedUIElementAttribute) else { return nil }
-        return Detector.check(focused: focused)
+        if case .bagel(let hit) = observeFocused() { return hit }
+        return nil
     }
 
     func check(source: String) {
-        guard Settings.armed, let app, let focused = axElement(app, kAXFocusedUIElementAttribute) else { return }
-        if let hit = Detector.check(focused: focused) {
+        guard Settings.armed else { return }
+        switch observeFocused() {
+        case .bagel(let hit):
+            guard hit != reported else { return }
+            reported = hit
             onHit?(hit, source)
-        } else if Detector.isTypingBagel(focused: focused) {
+        case .approaching:
+            reported = nil
             onApproach?()
+        case .clean:
+            reported = nil
         }
+    }
+
+    /// Report a bagel still in the box again, e.g. after the overlay closes without it being cleared.
+    func forgetReported() {
+        reported = nil
     }
 }
 
@@ -305,88 +372,68 @@ final class SendInterceptor {
 
     init(watcher: SlackWatcher) { self.watcher = watcher }
 
-
-    @discardableResult
-    func start() -> Bool {
-        guard tap == nil else { return true }
+    func start() {
         let mask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.leftMouseDown.rawValue)
         let callback: CGEventTapCallBack = { _, type, event, refcon in
-            let me = Unmanaged<SendInterceptor>.fromOpaque(refcon!).takeUnretainedValue()
-            return me.handle(type: type, event: event)
+            Unmanaged<SendInterceptor>.fromOpaque(refcon!).takeUnretainedValue().handle(type: type, event: event)
         }
         guard
             let tap = CGEvent.tapCreate(
                 tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
                 eventsOfInterest: CGEventMask(mask), callback: callback,
                 userInfo: Unmanaged.passUnretained(self).toOpaque())
-        else {
-            Log.write("event tap could not be created (Accessibility not granted yet?)")
-            return false
-        }
+        else { return Log.write("event tap could not be created") }
         self.tap = tap
-        let source = CFMachPortCreateRunLoopSource(nil, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
         Log.write("send interceptor active")
-        return true
     }
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        let pass = Unmanaged.passUnretained(event)
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             Log.write("event tap was disabled (\(type.rawValue)); re-enabling")
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
-            return Unmanaged.passUnretained(event)
+            return pass
         }
-        guard Settings.armed else { return Unmanaged.passUnretained(event) }
+        guard Settings.armed, let slackPid = watcher.pid else { return pass }
 
         if type == .keyDown {
             let key = Int(event.getIntegerValueField(.keyboardEventKeycode))
-            guard key == kVK_Return || key == kVK_ANSI_KeypadEnter else { return Unmanaged.passUnretained(event) }
-            let inSlack = watcher.slackIsFrontmost
-            let hit = inSlack ? watcher.currentHit() : nil
-            if Settings.debug {
-                let sourcePid = event.getIntegerValueField(.eventSourceUnixProcessID)
-                Log.write("debug: return (Slack focused: \(inSlack), source pid \(sourcePid)), bagel: \(hit?.reason ?? "none")")
-            }
-            guard let hit else { return Unmanaged.passUnretained(event) }
+            guard key == kVK_Return || key == kVK_ANSI_KeypadEnter, watcher.slackIsFrontmost,
+                let hit = watcher.currentHit()
+            else { return pass }
             onBlocked?(hit, "return key")
             return nil
         }
 
-        if type == .leftMouseDown, let pid = watcher.pid, clickIsOnSendButton(event.location, slackPid: pid),
-            let hit = watcher.currentHit()
+        if type == .leftMouseDown, windowOwner(under: event) ?? slackPid == slackPid,
+            clickIsOnSendButton(event.location, slackPid: slackPid), let hit = watcher.currentHit()
         {
             onBlocked?(hit, "send button")
             return nil
         }
-        return Unmanaged.passUnretained(event)
+        return pass
     }
 
-    /// Whether the click lands on Slack's Send button. Checks the element under the pointer, so it
-    /// does not depend on which app is frontmost.
+    /// The pid owning the window under the pointer, from the window server: cheap, and it keeps
+    /// clicks in other apps away from the accessibility hit test.
+    private func windowOwner(under event: CGEvent) -> pid_t? {
+        let window = CGWindowID(event.getIntegerValueField(.mouseEventWindowUnderMousePointer))
+        guard window != 0, let info = CGWindowListCopyWindowInfo(.optionIncludingWindow, window) as? [[String: Any]] else {
+            return nil
+        }
+        return info.first?[kCGWindowOwnerPID as String] as? pid_t
+    }
+
     private func clickIsOnSendButton(_ point: CGPoint, slackPid: pid_t) -> Bool {
         var element: AXUIElement?
-        var elementPid: pid_t = 0
-        let found = AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &element)
-        if let element { AXUIElementGetPid(element, &elementPid) }
-        if Settings.debug, elementPid == slackPid || found != .success {
-            let role: String? = element.flatMap { axAttr($0, kAXRoleAttribute) }
-            Log.write("debug: click at \(point) -> AX \(found.rawValue), pid \(elementPid), role \(role ?? "-")")
-        }
-        guard found == .success, let element, elementPid == slackPid else { return false }
-        var node: AXUIElement? = element
-        for _ in 0..<4 {
-            guard let current = node else { break }
-            let role: String? = axAttr(current, kAXRoleAttribute)
-            let label = (axAttr(current, kAXDescriptionAttribute) as String? ?? "") + " "
-                + (axAttr(current, kAXTitleAttribute) as String? ?? "")
-            if role == kAXButtonRole {
-                if Settings.debug { Log.write("debug: click on Slack button \"\(label.trimmingCharacters(in: .whitespaces))\"") }
-                return label.lowercased().contains("send")
-            }
-            node = axElement(current, kAXParentAttribute)
-        }
-        return false
+        var pid: pid_t = 0
+        guard AXUIElementCopyElementAtPosition(systemWide, Float(point.x), Float(point.y), &element) == .success,
+            let element, AXUIElementGetPid(element, &pid) == .success, pid == slackPid,
+            let button = axAncestors(element, limit: 4).first(where: { (axAttr($0, kAXRoleAttribute) as String?) == kAXButtonRole })
+        else { return false }
+        return axLabel(button).lowercased().contains("send")
     }
 }
 
@@ -396,14 +443,6 @@ enum Responder {
     /// Select all + delete in the focused field. Only sent while Slack is in front, so the keys go
     /// to its message box.
     static func clearFocusedField() {
-        let source = CGEventSource(stateID: .hidSystemState)
-        func press(_ key: Int, _ flags: CGEventFlags = []) {
-            for down in [true, false] {
-                let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(key), keyDown: down)
-                event?.flags = flags
-                event?.post(tap: .cghidEventTap)
-            }
-        }
         press(kVK_ANSI_A, .maskCommand)
         press(kVK_Delete)
     }
@@ -416,11 +455,15 @@ enum Responder {
             _ = unsafeBitCast(symbol, to: LockFn.self)()
             return
         }
-        // Fallback: the system Lock Screen shortcut, Ctrl+Cmd+Q.
+        // Fallback: the system Lock Screen shortcut.
+        press(kVK_ANSI_Q, [.maskCommand, .maskControl])
+    }
+
+    private static func press(_ key: Int, _ flags: CGEventFlags = []) {
         let source = CGEventSource(stateID: .hidSystemState)
         for down in [true, false] {
-            let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(kVK_ANSI_Q), keyDown: down)
-            event?.flags = [.maskCommand, .maskControl]
+            let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(key), keyDown: down)
+            event?.flags = flags
             event?.post(tap: .cghidEventTap)
         }
     }
@@ -433,9 +476,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     lazy var interceptor = SendInterceptor(watcher: watcher)
     let overlay = OverlayController()
     var statusItem: NSStatusItem!
-    var lastTrigger = Date.distantPast
-    var lastReason = ""
-    var trustTimer: Timer?
+    /// Set from detection until the overlay is up, so a second report in between is ignored.
+    var responding = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -448,20 +490,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         watcher.onHit = { [weak self] hit, source in self?.trigger(hit, source: source) }
         watcher.onApproach = { [weak self] in
-            guard let self, Settings.mugshot, [.overlayThenLock, .overlay].contains(Settings.action) else { return }
+            guard let self, Settings.mugshot, Settings.action.showsOverlay else { return }
             self.overlay.prewarmCamera()
         }
         interceptor.onBlocked = { [weak self] hit, source in
             // Called from inside the event tap; respond after the tap returns.
             DispatchQueue.main.async { self?.trigger(hit, source: source, blockedSend: true) }
         }
+        overlay.onClose = { [weak self] in self?.watcher.forgetReported() }
 
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         if AXIsProcessTrustedWithOptions(options) {
             startGuards()
         } else {
             Log.write("waiting for Accessibility permission")
-            trustTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
                 guard AXIsProcessTrusted() else { return }
                 timer.invalidate()
                 self?.startGuards()
@@ -470,9 +513,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func startGuards() {
-        Log.write(
-            "Accessibility granted; armed=\(Settings.armed) action=\(Settings.action.rawValue) "
-                + "input-monitoring=\(CGPreflightListenEventAccess()) post-events=\(CGPreflightPostEventAccess())")
+        Log.write("Accessibility granted; armed=\(Settings.armed) action=\(Settings.action.rawValue)")
         watcher.start()
         interceptor.start()
         refreshIcon()
@@ -484,42 +525,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func trigger(_ hit: Hit, source: String, blockedSend: Bool = false) {
-        let now = Date()
+        guard !responding, !overlay.isShowing else { return }
+        let detectedAt = Date()
         let action = Settings.action
-        // Log-only mode leaves the bagel in the box, so the poll would report it every 250 ms; log
-        // each one once. The other modes clear the box, so any later hit is a new attempt.
-        let isRepeat = action == .log && hit.reason == lastReason && now.timeIntervalSince(lastTrigger) < 30
-        guard blockedSend || (!isRepeat && now.timeIntervalSince(lastTrigger) > 1 && !overlay.isShowing) else { return }
-        lastTrigger = now
-        lastReason = hit.reason
-        Log.write(
-            "BAGEL in \"\(hit.field)\": \(hit.reason) (via \(source)\(blockedSend ? ", send blocked" : "")) -> \(action.rawValue)"
-        )
+        Log.write("BAGEL in \"\(hit.field)\": \(hit.evidence) (via \(source)\(blockedSend ? ", send blocked" : "")) -> \(action.rawValue)")
         guard action != .log else { return }
-        if Settings.mugshot && action != .lockOnly { overlay.startCamera() }
 
-        // The clear goes through the HID queue to the frontmost app, so give Slack a moment to take
-        // it before the overlay pulls focus away. Any Return typed meanwhile queues behind the clear.
-        let cleared = watcher.slackIsFrontmost
-        if cleared { Responder.clearFocusedField() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + (cleared ? 0.15 : 0)) { [self] in
-            // Only claim a response time once the box is confirmed empty.
-            let response = cleared && watcher.currentHit() == nil ? Int(Date().timeIntervalSince(now) * 1000) : nil
-            func booking(_ ending: Booking.Ending) -> Booking {
-                Booking(
-                    destination: Booking.destination(fromField: hit.field), evidence: Booking.evidence(fromReason: hit.reason),
-                    caseNumber: Settings.nextCaseNumber(), date: now, responseMilliseconds: response, ending: ending)
-            }
-            switch action {
-            case .overlayThenLock:
-                overlay.show(booking(.lock), takePhoto: Settings.mugshot)
-            case .overlay:
-                overlay.show(booking(.close), takePhoto: Settings.mugshot)
-            case .lockOnly:
-                Responder.lockScreen()
-            case .log:
-                break
-            }
+        let clearing = watcher.slackIsFrontmost
+        if clearing { Responder.clearFocusedField() }
+        if Settings.mugshot && action.showsOverlay { overlay.startCamera() }
+        responding = true
+        whenCleared(clearing, since: detectedAt) { [self] response in
+            responding = false
+            guard action.showsOverlay else { return Responder.lockScreen() }
+            let booking = Booking(
+                destination: Booking.destination(fromField: hit.field), evidence: hit.evidence.displayName,
+                caseNumber: Settings.nextCaseNumber(), date: detectedAt, responseMilliseconds: response,
+                ending: action == .overlayThenLock ? .lock : .close)
+            overlay.show(booking, takePhoto: Settings.mugshot)
+        }
+    }
+
+    /// The clear goes through the HID queue to the frontmost app, so wait for Slack to apply it
+    /// before the overlay takes focus (a Return typed meanwhile queues behind it). Calls `then` with
+    /// the time to a confirmed empty box, or nil if it isn't confirmed within 0.3 s.
+    private func whenCleared(_ clearing: Bool, since start: Date, then: @escaping (Int?) -> Void) {
+        guard clearing else { return then(nil) }
+        Timer.scheduledTimer(withTimeInterval: 0.01, repeats: true) { [weak self] timer in
+            let elapsed = Date().timeIntervalSince(start)
+            let cleared = self?.watcher.currentHit() == nil
+            guard cleared || elapsed > 0.3 else { return }
+            timer.invalidate()
+            then(cleared ? Int(elapsed * 1000) : nil)
         }
     }
 
@@ -550,29 +587,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
-        let armed = NSMenuItem(title: "Armed", action: #selector(toggleArmed), keyEquivalent: "")
-        armed.state = Settings.armed ? .on : .off
-        menu.addItem(armed)
+        menu.addItem(checkbox: "Armed", Settings.armed, #selector(toggleArmed))
         let actions = NSMenuItem(title: "When a bagel shows up", action: nil, keyEquivalent: "")
-        let submenu = NSMenu()
+        actions.submenu = NSMenu()
         for action in Action.allCases {
             let item = NSMenuItem(title: action.title, action: #selector(chooseAction(_:)), keyEquivalent: "")
             item.representedObject = action.rawValue
             item.state = Settings.action == action ? .on : .off
-            submenu.addItem(item)
+            actions.submenu?.addItem(item)
         }
-        actions.submenu = submenu
         menu.addItem(actions)
-        let mugshot = NSMenuItem(title: "Take a mugshot", action: #selector(toggleMugshot), keyEquivalent: "")
-        mugshot.state = Settings.mugshot ? .on : .off
-        menu.addItem(mugshot)
+        menu.addItem(checkbox: "Take a mugshot", Settings.mugshot, #selector(toggleMugshot))
         menu.addItem(NSMenuItem(title: "Preview overlay", action: #selector(testOverlay), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Open mugshots", action: #selector(openMugshots), keyEquivalent: ""))
         menu.addItem(.separator())
 
-        let login = NSMenuItem(title: "Start at login", action: #selector(toggleLoginItem), keyEquivalent: "")
-        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(login)
+        menu.addItem(checkbox: "Start at login", SMAppService.mainApp.status == .enabled, #selector(toggleLoginItem))
         menu.addItem(NSMenuItem(title: "Open log", action: #selector(openLog), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit BagelGuard", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -591,10 +621,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func testOverlay() {
-        let preview = Booking(
-            destination: "#office-london", evidence: "bagel emoji", caseNumber: 42, date: Date(), responseMilliseconds: 152,
-            ending: .preview)
-        overlay.show(preview, takePhoto: Settings.mugshot)
+        overlay.show(.sample(.preview), takePhoto: Settings.mugshot)
     }
 
     @objc func toggleMugshot() {
@@ -634,48 +661,16 @@ extension NSMenu {
         item.isEnabled = false
         addItem(item)
     }
-}
 
-// `BagelGuard --render out.png [photo.jpg]` draws the overlay off-screen to a PNG and exits, so the
-// design can be checked without covering the screen.
-if let flag = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.arguments.count > flag + 1 {
-    let out = CommandLine.arguments[flag + 1]
-    let booking = Booking(
-        destination: "#office-london", evidence: "bagel emoji", caseNumber: 42, date: Date(), responseMilliseconds: 152,
-        ending: .lock)
-    let mugshot: Mugshot
-    if CommandLine.arguments.count > flag + 2, let photo = NSImage(contentsOfFile: CommandLine.arguments[flag + 2]),
-        let cgImage = photo.cgImage(forProposedRect: nil, context: nil, hints: nil)
-    {
-        let face = MugshotCamera.face(in: cgImage)
-        mugshot = Mugshot(image: NSImage(cgImage: cgImage, size: .zero), face: face?.0, confidence: face?.1 ?? 0)
-    } else {
-        // No photo given: a synthetic sensor frame with a face box, to check the target lock.
-        let frame = NSImage(size: NSSize(width: 1280, height: 720), flipped: true) { rect in
-            NSGradient(starting: NSColor(white: 0.32, alpha: 1), ending: NSColor(white: 0.12, alpha: 1))?.draw(in: rect, angle: 90)
-            NSColor(white: 0.45, alpha: 1).setFill()
-            NSBezierPath(ovalIn: NSRect(x: 520, y: 170, width: 240, height: 300)).fill()
-            NSBezierPath(roundedRect: NSRect(x: 380, y: 500, width: 520, height: 400), xRadius: 200, yRadius: 200).fill()
-            return true
-        }
-        mugshot = Mugshot(image: frame, face: CGRect(x: 530, y: 200, width: 220, height: 250), confidence: 0.97)
+    func addItem(checkbox title: String, _ on: Bool, _ action: Selector) {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.state = on ? .on : .off
+        addItem(item)
     }
-    // Same drawing as a saved mugshot.
-    try! MugshotArchive.render(mugshot, for: booking)!.representation(using: .png, properties: [:])!
-        .write(to: URL(fileURLWithPath: out))
-    exit(0)
 }
 
-// `BagelGuard --camera-probe` logs per-frame brightness and the exposure flag for 3 s, covering the
-// screen with the dark overlay tint for the second half, then exits. For tuning when the photo is taken.
-if CommandLine.arguments.contains("--camera-probe") {
-    CameraProbe.run()
-    exit(0)
-}
-if CommandLine.arguments.contains("--snap-test") {
-    CameraProbe.snapTest()
-    exit(0)
-}
+Settings.register()
+DevTools.runIfRequested()
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
