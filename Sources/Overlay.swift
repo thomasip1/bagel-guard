@@ -1,6 +1,6 @@
 // The overlay: a frosted-glass interdiction screen. The webcam photo is taken the moment the bagel
-// is detected, the face in it is located with Vision, and a target lock is drawn on it. The photo is
-// only ever held in memory.
+// is detected, the face in it is located with Vision, and a target lock is drawn on it. Each caught
+// attempt's photo is saved to ~/Pictures/BagelGuard.
 
 import AVFoundation
 import Cocoa
@@ -43,6 +43,32 @@ struct Mugshot {
     let image: NSImage
     let face: CGRect?
     let confidence: Float
+}
+
+// MARK: - Saved mugshots
+
+enum MugshotArchive {
+    static let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Pictures/BagelGuard")
+
+    /// Writes e.g. "2026-10-20 15.48.53 case 0042 office-london.jpg".
+    static func save(_ mugshot: Mugshot, for booking: Booking) {
+        guard let cgImage = mugshot.image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        let stamp = DateFormatter()
+        stamp.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        let place = booking.destination.replacingOccurrences(of: "#", with: "")
+            .components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ ")).inverted).joined()
+        let name = "\(stamp.string(from: booking.date)) case \(String(format: "%04d", booking.caseNumber)) \(place).jpg"
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                let data = NSBitmapImageRep(cgImage: cgImage).representation(using: .jpeg, properties: [.compressionFactor: 0.88])
+                try data?.write(to: folder.appendingPathComponent(name))
+                Log.write("saved mugshot \(name)")
+            } catch {
+                Log.write("could not save mugshot: \(error)")
+            }
+        }
+    }
 }
 
 // MARK: - Palette and type
@@ -491,9 +517,19 @@ final class OverlayController {
     private var captured: Mugshot??
     private var prewarmTimeout: Timer?
     private var booking: Booking?
+    private var savedCase: Int?
     private var shownAt = Date.distantPast
 
     var isShowing: Bool { !windows.isEmpty }
+
+    /// Saves the photo once both it and a real (non-preview) booking exist.
+    private func saveIfCaught() {
+        guard let booking, booking.ending != .preview, savedCase != booking.caseNumber, isShowing,
+            case .some(.some(let mugshot)) = captured
+        else { return }
+        savedCase = booking.caseNumber
+        MugshotArchive.save(mugshot, for: booking)
+    }
 
     /// Starts the camera, unless it is already running, so the photo is of the person at the
     /// keyboard rather than of their reaction to the overlay.
@@ -507,6 +543,7 @@ final class OverlayController {
             { [weak self] mugshot in
                 self?.captured = .some(mugshot)
                 self?.views.forEach { $0.show(mugshot) }
+                self?.saveIfCaught()
             },
             onFace: { [weak self] face, confidence in
                 guard let self, case .some(.some(let photo)) = self.captured else { return }
@@ -565,6 +602,7 @@ final class OverlayController {
             views.forEach { $0.show(nil) }
         } else if let captured {
             views.forEach { $0.show(captured) }
+            saveIfCaught()
         } else {
             startCamera()
         }

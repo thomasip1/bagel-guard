@@ -558,6 +558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mugshot.state = Settings.mugshot ? .on : .off
         menu.addItem(mugshot)
         menu.addItem(NSMenuItem(title: "Preview overlay", action: #selector(testOverlay), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Open mugshots", action: #selector(openMugshots), keyEquivalent: ""))
         menu.addItem(.separator())
 
         let login = NSMenuItem(title: "Start at login", action: #selector(toggleLoginItem), keyEquivalent: "")
@@ -590,6 +591,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleMugshot() {
         Settings.mugshot.toggle()
         if Settings.mugshot { MugshotCamera.requestAccessIfNeeded() }
+    }
+
+    @objc func openMugshots() {
+        try? FileManager.default.createDirectory(at: MugshotArchive.folder, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(MugshotArchive.folder)
     }
 
     @objc func openLog() {
