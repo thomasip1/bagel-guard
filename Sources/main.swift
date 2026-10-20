@@ -7,7 +7,6 @@
 import ApplicationServices
 import Carbon.HIToolbox
 import Cocoa
-import IOKit
 import ServiceManagement
 
 let slackBundleID = "com.tinyspeck.slackmacgap"
@@ -22,10 +21,10 @@ enum Action: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .overlayThenLock: return "Overlay, then lock screen"
-        case .overlay: return "Overlay only"
-        case .lockOnly: return "Lock screen immediately"
-        case .log: return "Log only (dry run, still blocks send)"
+        case .overlayThenLock: return "Show overlay, then lock"
+        case .overlay: return "Show overlay"
+        case .lockOnly: return "Lock right away"
+        case .log: return "Only log it"
         }
     }
 }
@@ -125,8 +124,8 @@ enum Detector {
         return nil
     }
 
-    /// Checks the focused element of Slack: the message box (and its emoji images), and the emoji
-    /// picker's search field, which also covers bagel reactions.
+    /// Checks the focused element of Slack: the message box and its emoji images. Reactions are
+    /// left alone: the emoji picker's search field is not checked.
     static func check(focused: AXUIElement) -> Hit? {
         // The focused node can be a text run inside the box; walk up to the text area.
         var node: AXUIElement? = focused
@@ -142,11 +141,6 @@ enum Detector {
                 return nil
             }
             if role == kAXTextFieldRole || role == kAXComboBoxRole {
-                let placeholder: String = axAttr(current, kAXPlaceholderValueAttribute) ?? ""
-                let isEmojiSearch = (label + " " + placeholder).lowercased().contains("emoji")
-                if isEmojiSearch && value.lowercased().contains("bagel") {
-                    return Hit(reason: "emoji search \"\(value)\"", field: label.isEmpty ? placeholder : label)
-                }
                 if let reason = scan(text: value) { return Hit(reason: reason, field: label) }
                 return nil
             }
@@ -259,7 +253,8 @@ final class SlackWatcher {
 // MARK: - Send interception (event tap)
 
 /// Swallows Return and clicks on Slack's Send button while a bagel is in the message box. This is
-/// the backstop for a paste followed by Return faster than the 250 ms poll.
+/// a backstop: detection normally clears the box first. While any app holds Secure Keyboard Entry
+/// the tap receives no keystrokes, so only the Send-button check works then.
 final class SendInterceptor {
     private var tap: CFMachPort?
     let watcher: SlackWatcher
@@ -267,22 +262,6 @@ final class SendInterceptor {
 
     init(watcher: SlackWatcher) { self.watcher = watcher }
 
-    var isActive: Bool { tap.map { CGEvent.tapIsEnabled(tap: $0) } ?? false }
-
-    /// While any process holds Secure Keyboard Entry, event taps receive no keystrokes, so Return
-    /// cannot be blocked (clicks on Send still can). loginwindow sometimes keeps it after an unlock;
-    /// locking and unlocking the screen releases it.
-    static var secureInputHolder: String? {
-        guard IsSecureEventInputEnabled() else { return nil }
-        // The CGSession dictionary reports the frontmost app here; IOConsoleUsers has the real holder.
-        let root = IORegistryGetRootEntry(kIOMainPortDefault)
-        defer { IOObjectRelease(root) }
-        let users = IORegistryEntryCreateCFProperty(root, "IOConsoleUsers" as CFString, kCFAllocatorDefault, 0)?
-            .takeRetainedValue() as? [[String: Any]]
-        guard let pid = users?.compactMap({ $0["kCGSSessionSecureInputPID"] as? Int }).first else { return "unknown app" }
-        var name = [CChar](repeating: 0, count: 256)
-        return proc_name(pid_t(pid), &name, UInt32(name.count)) > 0 ? String(cString: name) : "pid \(pid)"
-    }
 
     @discardableResult
     func start() -> Bool {
@@ -305,7 +284,7 @@ final class SendInterceptor {
         let source = CFMachPortCreateRunLoopSource(nil, tap, 0)
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
-        Log.write("send interceptor active (secure keyboard entry on: \(SendInterceptor.secureInputHolder ?? "no"))")
+        Log.write("send interceptor active")
         return true
     }
 
@@ -565,24 +544,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        if !AXIsProcessTrusted() {
+            menu.addItem(disabled: "Needs the Accessibility permission")
+            menu.addItem(NSMenuItem(title: "Open Accessibility settings…", action: #selector(openAXSettings), keyEquivalent: ""))
+        } else if !Settings.armed {
+            menu.addItem(disabled: "Not watching Slack")
+        } else {
+            menu.addItem(disabled: watcher.pid == nil ? "Waiting for Slack to open" : "Watching Slack for bagels")
+        }
+        menu.addItem(.separator())
+
         let armed = NSMenuItem(title: "Armed", action: #selector(toggleArmed), keyEquivalent: "")
         armed.state = Settings.armed ? .on : .off
         menu.addItem(armed)
-        menu.addItem(.separator())
-
-        let trusted = AXIsProcessTrusted()
-        menu.addItem(disabled: "Accessibility: \(trusted ? "granted" : "not granted")")
-        menu.addItem(disabled: "Slack: \(watcher.pid.map { "watching pid \($0)" } ?? "not running")")
-        menu.addItem(disabled: "Send intercept: \(interceptor.isActive ? "active" : "inactive")")
-        if let holder = SendInterceptor.secureInputHolder {
-            menu.addItem(disabled: "⚠️ Return can't be blocked: Secure Keyboard Entry held by \(holder)")
-        }
-        if !trusted {
-            menu.addItem(NSMenuItem(title: "Open Accessibility settings…", action: #selector(openAXSettings), keyEquivalent: ""))
-        }
-        menu.addItem(.separator())
-
-        let actions = NSMenuItem(title: "When a bagel is detected", action: nil, keyEquivalent: "")
+        let actions = NSMenuItem(title: "When a bagel shows up", action: nil, keyEquivalent: "")
         let submenu = NSMenu()
         for action in Action.allCases {
             let item = NSMenuItem(title: action.title, action: #selector(chooseAction(_:)), keyEquivalent: "")
@@ -592,11 +567,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         actions.submenu = submenu
         menu.addItem(actions)
-        menu.addItem(NSMenuItem(title: "Test overlay (no lock)", action: #selector(testOverlay), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Open log", action: #selector(openLog), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Preview overlay", action: #selector(testOverlay), keyEquivalent: ""))
+        menu.addItem(.separator())
+
         let login = NSMenuItem(title: "Start at login", action: #selector(toggleLoginItem), keyEquivalent: "")
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
+        menu.addItem(NSMenuItem(title: "Open log", action: #selector(openLog), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit BagelGuard", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
