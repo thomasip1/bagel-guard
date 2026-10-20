@@ -457,6 +457,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "BAGEL in \"\(hit.field)\": \(hit.reason) (via \(source)\(blockedSend ? ", send blocked" : "")) -> \(action.rawValue)"
         )
         guard action != .log else { return }
+        if Settings.mugshot && action != .lockOnly { overlay.startCamera() }
 
         // The clear goes through the HID queue to the frontmost app, so give Slack a moment to take
         // it before the overlay pulls focus away. Any Return typed meanwhile queues behind the clear.
@@ -589,7 +590,7 @@ if let flag = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.argu
     let out = CommandLine.arguments[flag + 1]
     let photo = CommandLine.arguments.count > flag + 2 ? NSImage(contentsOfFile: CommandLine.arguments[flag + 2]) : nil
     let size = NSScreen.main?.frame.size ?? NSSize(width: 1728, height: 1117)
-    let view = MugshotView(booking: Booking(destination: "#office-london", caseNumber: 42, date: Date(), ending: .lock))
+    let view = BookingView(booking: Booking(destination: "#office-london", caseNumber: 42, date: Date(), ending: .lock))
     view.frame = NSRect(origin: .zero, size: size)
     if let photo { view.show(photo: photo, quietly: true) } else { view.show(photo: nil) }
     let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
