@@ -631,17 +631,15 @@ extension NSMenu {
 // design can be checked without covering the screen.
 if let flag = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.arguments.count > flag + 1 {
     let out = CommandLine.arguments[flag + 1]
-    let photo = CommandLine.arguments.count > flag + 2 ? NSImage(contentsOfFile: CommandLine.arguments[flag + 2]) : nil
-    let size = NSScreen.main?.frame.size ?? NSSize(width: 1728, height: 1117)
-    let view = InterdictionView(
-        booking: Booking(
-            destination: "#office-london", evidence: "bagel emoji", caseNumber: 42, date: Date(), responseMilliseconds: 152,
-            ending: .lock))
-    view.paintsBackdrop = true
-    view.frame = NSRect(origin: .zero, size: size)
-    if let photo, let cgImage = photo.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+    let booking = Booking(
+        destination: "#office-london", evidence: "bagel emoji", caseNumber: 42, date: Date(), responseMilliseconds: 152,
+        ending: .lock)
+    let mugshot: Mugshot
+    if CommandLine.arguments.count > flag + 2, let photo = NSImage(contentsOfFile: CommandLine.arguments[flag + 2]),
+        let cgImage = photo.cgImage(forProposedRect: nil, context: nil, hints: nil)
+    {
         let face = MugshotCamera.face(in: cgImage)
-        view.show(Mugshot(image: NSImage(cgImage: cgImage, size: .zero), face: face?.0, confidence: face?.1 ?? 0), quietly: true)
+        mugshot = Mugshot(image: NSImage(cgImage: cgImage, size: .zero), face: face?.0, confidence: face?.1 ?? 0)
     } else {
         // No photo given: a synthetic sensor frame with a face box, to check the target lock.
         let frame = NSImage(size: NSSize(width: 1280, height: 720), flipped: true) { rect in
@@ -651,11 +649,11 @@ if let flag = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.argu
             NSBezierPath(roundedRect: NSRect(x: 380, y: 500, width: 520, height: 400), xRadius: 200, yRadius: 200).fill()
             return true
         }
-        view.show(Mugshot(image: frame, face: CGRect(x: 530, y: 200, width: 220, height: 250), confidence: 0.97), quietly: true)
+        mugshot = Mugshot(image: frame, face: CGRect(x: 530, y: 200, width: 220, height: 250), confidence: 0.97)
     }
-    let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
-    view.cacheDisplay(in: view.bounds, to: rep)
-    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: out))
+    // Same drawing as a saved mugshot.
+    try! MugshotArchive.render(mugshot, for: booking)!.representation(using: .png, properties: [:])!
+        .write(to: URL(fileURLWithPath: out))
     exit(0)
 }
 

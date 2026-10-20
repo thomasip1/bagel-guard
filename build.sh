@@ -27,7 +27,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
-    <key>NSCameraUsageDescription</key><string>BagelGuard takes a mugshot of whoever tries to post a bagel. Each photo is shown on screen and saved to Pictures/BagelGuard.</string>
+    <key>NSCameraUsageDescription</key><string>BagelGuard takes a mugshot of whoever tries to post a bagel. Each attempt is shown on screen and saved to Pictures/BagelGuard.</string>
 </dict>
 </plist>
 PLIST
