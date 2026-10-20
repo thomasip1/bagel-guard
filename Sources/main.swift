@@ -40,6 +40,19 @@ enum Settings {
     /// `defaults write com.thomasip.bagelguard debug -bool true` logs every Return pressed in Slack.
     static var debug: Bool { defaults.bool(forKey: "debug") }
 
+    /// Whether the overlay takes a webcam photo of whoever tried.
+    static var mugshot: Bool {
+        get { defaults.object(forKey: "mugshot") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "mugshot") }
+    }
+
+    /// Counts caught attempts; shown as the case number on the placard.
+    static func nextCaseNumber() -> Int {
+        let next = defaults.integer(forKey: "caseCount") + 1
+        defaults.set(next, forKey: "caseCount")
+        return next
+    }
+
     static var action: Action {
         get { Action(rawValue: defaults.string(forKey: "action") ?? "") ?? .overlayThenLock }
         set { defaults.set(newValue.rawValue, forKey: "action") }
@@ -383,75 +396,6 @@ enum Responder {
     }
 }
 
-final class OverlayController {
-    private var windows: [NSWindow] = []
-    private var dismissTimer: Timer?
-
-    var isShowing: Bool { !windows.isEmpty }
-
-    func show(reason: String, duration: TimeInterval, then completion: (() -> Void)? = nil) {
-        dismiss()
-        for screen in NSScreen.screens {
-            let window = OverlayWindow(
-                contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
-            window.level = .screenSaver
-            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-            window.backgroundColor = NSColor(calibratedRed: 0.75, green: 0.05, blue: 0.1, alpha: 0.94)
-            window.isOpaque = false
-            window.onDismiss = { [weak self] in self?.dismiss() }
-            window.contentView = makeContent(reason: reason)
-            window.makeKeyAndOrderFront(nil)
-            windows.append(window)
-        }
-        NSApp.activate(ignoringOtherApps: true)
-        NSSound(named: "Sosumi")?.play()
-        dismissTimer = Timer.scheduledTimer(withTimeInterval: duration, repeats: false) { [weak self] _ in
-            self?.dismiss()
-            completion?()
-        }
-    }
-
-    func dismiss() {
-        dismissTimer?.invalidate()
-        dismissTimer = nil
-        windows.forEach { $0.orderOut(nil) }
-        windows = []
-    }
-
-    private func makeContent(reason: String) -> NSView {
-        func label(_ text: String, size: CGFloat, weight: NSFont.Weight = .bold) -> NSTextField {
-            let field = NSTextField(labelWithString: text)
-            field.font = .systemFont(ofSize: size, weight: weight)
-            field.textColor = .white
-            field.alignment = .center
-            return field
-        }
-        let stack = NSStackView(views: [
-            label("🥯🚫", size: 200),
-            label("Bagel intercepted", size: 64, weight: .heavy),
-            label("Nice try. Nothing was sent, and this Mac is locking itself.", size: 28, weight: .medium),
-            label("Detected: \(reason)", size: 16, weight: .regular),
-        ])
-        stack.orientation = .vertical
-        stack.spacing = 18
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        let container = NSView()
-        container.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.centerXAnchor.constraint(equalTo: container.centerXAnchor),
-            stack.centerYAnchor.constraint(equalTo: container.centerYAnchor),
-        ])
-        return container
-    }
-}
-
-final class OverlayWindow: NSWindow {
-    var onDismiss: (() -> Void)?
-    override var canBecomeKey: Bool { true }
-    override func mouseDown(with event: NSEvent) { onDismiss?() }
-    override func keyDown(with event: NSEvent) { onDismiss?() }
-}
-
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -496,6 +440,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         watcher.start()
         interceptor.start()
         refreshIcon()
+        if Settings.mugshot { MugshotCamera.requestAccessIfNeeded() }
+        if CommandLine.arguments.contains("--preview") { testOverlay() }
     }
 
     func trigger(_ hit: Hit, source: String, blockedSend: Bool = false) {
@@ -522,17 +468,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             clearDelay = 0
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + clearDelay) { [self] in
+            let destination = Booking.destination(fromField: hit.field)
             switch action {
             case .overlayThenLock:
-                overlay.show(reason: hit.reason, duration: 2.5) { Responder.lockScreen() }
+                overlay.show(booking(to: destination, ending: .lock), takePhoto: Settings.mugshot)
             case .overlay:
-                overlay.show(reason: hit.reason, duration: 10)
+                overlay.show(booking(to: destination, ending: .close), takePhoto: Settings.mugshot)
             case .lockOnly:
                 Responder.lockScreen()
             case .log:
                 break
             }
         }
+    }
+
+    func booking(to destination: String, ending: Booking.Ending) -> Booking {
+        Booking(destination: destination, caseNumber: Settings.nextCaseNumber(), date: Date(), ending: ending)
     }
 
     // MARK: Menu
@@ -567,6 +518,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         actions.submenu = submenu
         menu.addItem(actions)
+        let mugshot = NSMenuItem(title: "Take a mugshot", action: #selector(toggleMugshot), keyEquivalent: "")
+        mugshot.state = Settings.mugshot ? .on : .off
+        menu.addItem(mugshot)
         menu.addItem(NSMenuItem(title: "Preview overlay", action: #selector(testOverlay), keyEquivalent: ""))
         menu.addItem(.separator())
 
@@ -591,7 +545,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func testOverlay() {
-        overlay.show(reason: "test from the menu", duration: 4)
+        let preview = Booking(destination: "#office-london", caseNumber: 42, date: Date(), ending: .preview)
+        overlay.show(preview, takePhoto: Settings.mugshot)
+    }
+
+    @objc func toggleMugshot() {
+        Settings.mugshot.toggle()
+        if Settings.mugshot { MugshotCamera.requestAccessIfNeeded() }
     }
 
     @objc func openLog() {
@@ -621,6 +581,21 @@ extension NSMenu {
         item.isEnabled = false
         addItem(item)
     }
+}
+
+// `BagelGuard --render out.png [photo.jpg]` draws the overlay off-screen to a PNG and exits, so the
+// design can be checked without covering the screen.
+if let flag = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.arguments.count > flag + 1 {
+    let out = CommandLine.arguments[flag + 1]
+    let photo = CommandLine.arguments.count > flag + 2 ? NSImage(contentsOfFile: CommandLine.arguments[flag + 2]) : nil
+    let size = NSScreen.main?.frame.size ?? NSSize(width: 1728, height: 1117)
+    let view = MugshotView(booking: Booking(destination: "#office-london", caseNumber: 42, date: Date(), ending: .lock))
+    view.frame = NSRect(origin: .zero, size: size)
+    if let photo { view.show(photo: photo, quietly: true) } else { view.show(photo: nil) }
+    let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
+    view.cacheDisplay(in: view.bounds, to: rep)
+    try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: out))
+    exit(0)
 }
 
 let app = NSApplication.shared

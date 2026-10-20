@@ -12,7 +12,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 
 swiftc -O -swift-version 5 -target arm64-apple-macos14 \
-    -o "$APP/Contents/MacOS/BagelGuard" Sources/main.swift
+    -o "$APP/Contents/MacOS/BagelGuard" Sources/*.swift
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -27,6 +27,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
+    <key>NSCameraUsageDescription</key><string>BagelGuard takes a mugshot of whoever tries to post a bagel. The photo is only shown on screen and never saved.</string>
 </dict>
 </plist>
 PLIST
