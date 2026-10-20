@@ -409,6 +409,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // Keeps the spot the user ⌘-drags it to, so it can be moved clear of the notch once.
+        statusItem.autosaveName = "BagelGuard"
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
@@ -487,8 +489,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Menu
 
     func refreshIcon() {
-        statusItem.button?.title = Settings.armed ? "🥯🛡" : "🥯"
+        statusItem.button?.title = "🥯"
+        statusItem.button?.alphaValue = Settings.armed ? 1 : 0.4
         statusItem.button?.toolTip = "BagelGuard (\(Settings.armed ? "armed" : "disarmed"))"
+    }
+
+    /// Opening the app again while it runs shows its menu at the pointer, for when the menu bar
+    /// item is hidden behind the notch.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        statusItem.menu?.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+        return false
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
