@@ -1,17 +1,22 @@
-// The overlay: a police booking record for whoever tried to post the bagel, with a webcam photo
-// taken the moment the bagel was detected. The photo is only ever held in memory.
+// The overlay: a frosted-glass interdiction screen. The webcam photo is taken the moment the bagel
+// is detected, the face in it is located with Vision, and a target lock is drawn on it. The photo is
+// only ever held in memory.
 
 import AVFoundation
 import Cocoa
 import CoreImage
+import Vision
 
 /// What the overlay says about one attempt.
 struct Booking {
     enum Ending { case lock, close, preview }
 
     let destination: String
+    let evidence: String
     let caseNumber: Int
     let date: Date
+    /// Time from detection to the message box being cleared.
+    let responseMilliseconds: Int?
     let ending: Ending
 
     /// Slack labels the message box "Message to <channel or person>".
@@ -21,31 +26,45 @@ struct Booking {
         // Channel names have no spaces; people's names usually do.
         return name.contains(" ") ? name : "#\(name)"
     }
+
+    /// Turns a detector reason ("emoji image \"bagel pet emoji\"", "shortcode :bagel") into what
+    /// was found.
+    static func evidence(fromReason reason: String) -> String {
+        if reason.hasPrefix("emoji image") {
+            return reason.replacingOccurrences(of: "emoji image ", with: "").replacingOccurrences(of: "\"", with: "")
+        }
+        if reason.hasPrefix("shortcode ") { return reason.replacingOccurrences(of: "shortcode ", with: "") + " shortcode" }
+        return "🥯 U+1F96F"
+    }
+}
+
+/// A webcam frame and, if Vision found one, the face in it (image pixels, top-left origin).
+struct Mugshot {
+    let image: NSImage
+    let face: CGRect?
+    let confidence: Float
 }
 
 // MARK: - Palette and type
 
-enum Record {
-    static let paper = NSColor(srgbRed: 0xF4 / 255, green: 0xF6 / 255, blue: 0xF8 / 255, alpha: 1)
-    static let navy = NSColor(srgbRed: 0x13 / 255, green: 0x29 / 255, blue: 0x4B / 255, alpha: 1)
-    static let ink = NSColor(srgbRed: 0x0E / 255, green: 0x1A / 255, blue: 0x2B / 255, alpha: 1)
-    static let label = NSColor(srgbRed: 0x5B / 255, green: 0x66 / 255, blue: 0x75 / 255, alpha: 1)
-    static let rule = NSColor(srgbRed: 0xC9 / 255, green: 0xCE / 255, blue: 0xD6 / 255, alpha: 1)
-    static let footer = NSColor(srgbRed: 0xE4 / 255, green: 0xE8 / 255, blue: 0xED / 255, alpha: 1)
-    static let alert = NSColor(srgbRed: 0xB3 / 255, green: 0x12 / 255, blue: 0x2E / 255, alpha: 1)
-    static let darkroom = NSColor(srgbRed: 0x2B / 255, green: 0x35 / 255, blue: 0x42 / 255, alpha: 1)
+enum Glass {
+    static let tint = NSColor(srgbRed: 0x05 / 255, green: 0x08 / 255, blue: 0x0D / 255, alpha: 0.62)
+    static let grid = NSColor.white.withAlphaComponent(0.035)
+    static let panelFill = NSColor.white.withAlphaComponent(0.055)
+    static let panelEdge = NSColor.white.withAlphaComponent(0.16)
+    static let primary = NSColor.white.withAlphaComponent(0.94)
+    static let secondary = NSColor.white.withAlphaComponent(0.62)
+    static let tertiary = NSColor.white.withAlphaComponent(0.38)
+    static let hairline = NSColor.white.withAlphaComponent(0.12)
+    static let lock = NSColor(srgbRed: 0xFF / 255, green: 0xB0 / 255, blue: 0x20 / 255, alpha: 1)
+    static let sensor = NSColor(srgbRed: 0x10 / 255, green: 0x15 / 255, blue: 0x1C / 255, alpha: 1)
 
-    /// DIN ships with macOS and reads as official signage.
-    static func dinCondensed(_ size: CGFloat) -> NSFont {
-        NSFont(name: "DINCondensed-Bold", size: size) ?? .systemFont(ofSize: size, weight: .heavy)
-    }
-
-    static func din(_ size: CGFloat) -> NSFont {
-        NSFont(name: "DINAlternate-Bold", size: size) ?? .systemFont(ofSize: size, weight: .bold)
-    }
-
-    static func text(_ size: CGFloat, weight: NSFont.Weight = .regular) -> NSFont {
+    static func display(_ size: CGFloat, _ weight: NSFont.Weight = .light) -> NSFont {
         .systemFont(ofSize: size, weight: weight)
+    }
+
+    static func mono(_ size: CGFloat, _ weight: NSFont.Weight = .regular) -> NSFont {
+        .monospacedSystemFont(ofSize: size, weight: weight)
     }
 }
 
@@ -58,7 +77,7 @@ extension NSScreen {
 
 // MARK: - Camera
 
-/// Grabs one frame from the default camera as soon as its exposure has settled.
+/// Grabs one frame from the default camera as soon as its exposure has settled, and finds the face.
 final class MugshotCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     static var isAuthorized: Bool { AVCaptureDevice.authorizationStatus(for: .video) == .authorized }
 
@@ -68,14 +87,26 @@ final class MugshotCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         AVCaptureDevice.requestAccess(for: .video) { granted in Log.write("camera access granted: \(granted)") }
     }
 
+    /// The largest face Vision finds, in image pixels with a top-left origin.
+    static func face(in image: CGImage) -> (CGRect, Float)? {
+        let request = VNDetectFaceRectanglesRequest()
+        try? VNImageRequestHandler(cgImage: image).perform([request])
+        guard let face = request.results?.max(by: { $0.boundingBox.width < $1.boundingBox.width }) else { return nil }
+        let box = face.boundingBox
+        let width = CGFloat(image.width)
+        let height = CGFloat(image.height)
+        let rect = CGRect(x: box.minX * width, y: (1 - box.maxY) * height, width: box.width * width, height: box.height * height)
+        return (rect, face.confidence)
+    }
+
     private let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "com.thomasip.bagelguard.camera")
     private var device: AVCaptureDevice?
-    private var completion: ((NSImage?) -> Void)?
+    private var completion: ((Mugshot?) -> Void)?
     private var startedAt = Date()
     private var grabbed = false  // only touched on `queue`
 
-    func snap(_ completion: @escaping (NSImage?) -> Void) {
+    func snap(_ completion: @escaping (Mugshot?) -> Void) {
         guard Self.isAuthorized, let device = AVCaptureDevice.default(for: .video),
             let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input)
         else { return completion(nil) }
@@ -107,47 +138,64 @@ final class MugshotCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let elapsed = Date().timeIntervalSince(startedAt)
         guard elapsed > 1.1 || (elapsed > 0.25 && device?.isAdjustingExposure == false) else { return }
         grabbed = true
-        // Booking photos are flat and slightly washed out.
-        let image = CIImage(cvPixelBuffer: buffer).applyingFilter(
-            "CIColorControls", parameters: [kCIInputSaturationKey: 0.35, kCIInputContrastKey: 1.08])
-        let cgImage = CIContext().createCGImage(image, from: image.extent)
-        let photo = cgImage.map { NSImage(cgImage: $0, size: NSSize(width: $0.width, height: $0.height)) }
-        DispatchQueue.main.async { self.deliver(photo) }
+        // Cool, low-saturation sensor look.
+        let image = CIImage(cvPixelBuffer: buffer)
+            .applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0.15, kCIInputContrastKey: 1.1])
+            .applyingFilter("CITemperatureAndTint", parameters: ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 7600, y: 0)])
+        guard let cgImage = CIContext().createCGImage(image, from: image.extent) else {
+            return DispatchQueue.main.async { self.deliver(nil) }
+        }
+        let face = Self.face(in: cgImage)
+        let mugshot = Mugshot(
+            image: NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height)),
+            face: face?.0, confidence: face?.1 ?? 0)
+        DispatchQueue.main.async { self.deliver(mugshot) }
     }
 
-    private func deliver(_ photo: NSImage?) {
+    private func deliver(_ mugshot: Mugshot?) {
         guard let completion else { return }
         self.completion = nil
-        completion(photo)
+        completion(mugshot)
         queue.async { [session] in session.stopRunning() }
     }
 }
 
 // MARK: - Views
 
-/// Plain navy, for screens other than the one showing the record.
-final class BackdropView: NSView {
+/// Darkens the frosted screen and lays a faint grid over it. Shown on every screen.
+class TintView: NSView {
+    override var isFlipped: Bool { true }
+
     override func draw(_ dirtyRect: NSRect) {
-        Record.navy.setFill()
+        Glass.tint.setFill()
         bounds.fill()
+        Glass.grid.setFill()
+        let step: CGFloat = 64
+        for x in stride(from: bounds.minX, through: bounds.maxX, by: step) {
+            NSRect(x: x, y: 0, width: 1, height: bounds.height).fill()
+        }
+        for y in stride(from: bounds.minY, through: bounds.maxY, by: step) {
+            NSRect(x: 0, y: y, width: bounds.width, height: 1).fill()
+        }
     }
 }
 
-/// The booking record: header bar, front-view photo with a height ruler, the charge, the details
-/// and a footer saying what happens next.
-final class BookingView: NSView {
+/// The glass panel: the photo with its target lock, the headline, the telemetry and the footer.
+final class InterdictionView: TintView {
     enum Photo {
         case developing
-        case taken(NSImage)
+        case taken(Mugshot)
         case none
     }
 
     let booking: Booking
+    /// Off-screen renders have no frosted window behind them, so they paint their own backdrop.
+    var paintsBackdrop = false
     private(set) var photo: Photo = .developing {
         didSet { needsDisplay = true }
     }
-
-    override var isFlipped: Bool { true }
+    private var lockProgress: CGFloat = 1
+    private var lockTimer: Timer?
 
     init(booking: Booking) {
         self.booking = booking
@@ -156,163 +204,235 @@ final class BookingView: NSView {
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    func show(photo image: NSImage?, quietly: Bool = false) {
-        guard let image else {
+    func show(_ mugshot: Mugshot?, quietly: Bool = false) {
+        guard let mugshot else {
             photo = .none
             return
         }
-        photo = .taken(image)
+        photo = .taken(mugshot)
         guard !quietly else { return }
         NSSound(
             contentsOfFile: "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/Shutter.aif",
             byReference: true)?.play()
+        guard mugshot.face != nil, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        // The one animation: the target lock closes in on the face.
+        lockProgress = 0
+        let start = Date()
+        lockTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
+            guard let self else { return timer.invalidate() }
+            let t = min(1, Date().timeIntervalSince(start) / 0.42)
+            self.lockProgress = 1 - pow(1 - t, 3)
+            self.needsDisplay = true
+            if t >= 1 { timer.invalidate() }
+        }
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        if paintsBackdrop {
+            NSGradient(colors: [NSColor(srgbRed: 0.10, green: 0.13, blue: 0.17, alpha: 1), NSColor(srgbRed: 0.03, green: 0.04, blue: 0.06, alpha: 1)])?
+                .draw(in: bounds, angle: -90)
+        }
+        super.draw(dirtyRect)
+
         let w = bounds.width
         let h = bounds.height
-        let margin = w * 0.055
+        let unit = h * 0.012
 
-        Record.paper.setFill()
-        bounds.fill()
+        // Size the panel to its content: top bar, a 4:3 sensor frame, the footer.
+        let panelWidth = w * 0.86
+        let pad = panelWidth * 0.04
+        let innerWidth = panelWidth - pad * 2
+        var frameWidth = innerWidth * 0.56
+        let chrome = unit * 4.5 + unit * 4.5 + unit * 2
+        frameWidth = min(frameWidth, (h * 0.86 - pad * 2 - chrome) * 4 / 3)
+        let panelHeight = pad * 2 + chrome + frameWidth * 3 / 4
+        let panel = NSRect(x: (w - panelWidth) / 2, y: (h - panelHeight) / 2, width: panelWidth, height: panelHeight)
+        drawPanel(panel)
+        let inner = panel.insetBy(dx: pad, dy: pad)
 
-        // Header.
-        let header = NSRect(x: 0, y: 0, width: w, height: h * 0.1)
-        Record.navy.setFill()
-        header.fill()
-        let title = attributed("Scale PD", Record.din(h * 0.034), .white)
-        let subtitle = attributed("Booking record", Record.text(h * 0.02), NSColor.white.withAlphaComponent(0.72))
-        let titleY = header.midY - title.size().height / 2
-        title.draw(at: NSPoint(x: margin, y: titleY))
-        subtitle.draw(at: NSPoint(x: margin + title.size().width + h * 0.02, y: header.midY - subtitle.size().height / 2))
-        let caseText = attributed("Case \(String(format: "%04d", booking.caseNumber))", Record.din(h * 0.034), .white)
-        caseText.draw(at: NSPoint(x: w - margin - caseText.size().width, y: titleY))
+        // Top bar.
+        let topBar = mono("BAGELGUARD", Glass.mono(unit * 1.15, .medium), Glass.tertiary)
+        topBar.draw(at: NSPoint(x: inner.minX, y: inner.minY))
+        let caseLabel = mono("CASE \(String(format: "%04d", booking.caseNumber))", Glass.mono(unit * 1.15, .medium), Glass.tertiary)
+        caseLabel.draw(at: NSPoint(x: inner.maxX - caseLabel.size().width, y: inner.minY))
 
         // Footer.
-        let footer = NSRect(x: 0, y: h * 0.91, width: w, height: h * 0.09)
-        Record.footer.setFill()
-        footer.fill()
+        let footerY = inner.maxY - unit * 2
+        Glass.hairline.setFill()
+        NSRect(x: inner.minX, y: footerY - unit * 2.2, width: inner.width, height: 1).fill()
         let next: String
         switch booking.ending {
         case .lock: next = "Click anywhere to lock this Mac."
         case .close: next = "Click anywhere to close."
         case .preview: next = "Preview. Click anywhere to close."
         }
-        let nextText = attributed(next, Record.text(h * 0.022, weight: .semibold), Record.ink)
-        nextText.draw(at: NSPoint(x: margin, y: footer.midY - nextText.size().height / 2))
-        let privacy = attributed("The photo is shown here only and is never saved.", Record.text(h * 0.017), Record.label)
-        privacy.draw(at: NSPoint(x: w - margin - privacy.size().width, y: footer.midY - privacy.size().height / 2))
+        text(next, Glass.display(unit * 1.6, .medium), Glass.primary).draw(at: NSPoint(x: inner.minX, y: footerY - unit * 0.6))
+        let privacy = text("The photo stays on this screen and is never saved.", Glass.display(unit * 1.3, .regular), Glass.tertiary)
+        privacy.draw(at: NSPoint(x: inner.maxX - privacy.size().width, y: footerY - unit * 0.35))
 
-        // Photo with a height ruler on its left edge.
-        let bodyTop = header.maxY + h * 0.065
-        let bodyBottom = footer.minY - h * 0.065
-        let rulerWidth = h * 0.055
-        let photoHeight = bodyBottom - bodyTop - h * 0.04
-        let photoRect = NSRect(x: margin + rulerWidth, y: bodyTop, width: photoHeight * 0.8, height: photoHeight)
-        drawPhoto(in: photoRect)
-        drawRuler(beside: photoRect, width: rulerWidth)
-        attributed("Front view", Record.text(h * 0.016), Record.label)
-            .draw(at: NSPoint(x: photoRect.minX, y: photoRect.maxY + h * 0.012))
+        // Body: sensor frame on the left, readout on the right.
+        let bodyTop = inner.minY + unit * 4.5
+        let frame = NSRect(x: inner.minX, y: bodyTop, width: frameWidth, height: frameWidth * 3 / 4)
+        drawSensorFrame(frame, unit: unit)
 
-        // Charge and details.
-        let gap = w * 0.05
-        let column = NSRect(
-            x: photoRect.maxX + gap, y: bodyTop, width: w - margin - photoRect.maxX - gap, height: photoRect.height)
-        drawDetails(in: column)
+        let gap = inner.width * 0.05
+        let column = NSRect(x: frame.maxX + gap, y: bodyTop, width: inner.maxX - frame.maxX - gap, height: frame.height)
+        drawReadout(in: column, unit: unit)
     }
 
-    private func drawPhoto(in rect: NSRect) {
+    private func drawPanel(_ rect: NSRect) {
+        let path = NSBezierPath(roundedRect: rect, xRadius: 28, yRadius: 28)
+        Glass.panelFill.setFill()
+        path.fill()
+        // Light catching the top edge of the glass.
+        NSGraphicsContext.saveGraphicsState()
+        path.addClip()
+        NSGradient(starting: NSColor.white.withAlphaComponent(0.07), ending: NSColor.white.withAlphaComponent(0))?
+            .draw(in: NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height * 0.35), angle: 90)
+        NSGraphicsContext.restoreGraphicsState()
+        Glass.panelEdge.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+    }
+
+    // MARK: Sensor frame
+
+    private func drawSensorFrame(_ rect: NSRect, unit: CGFloat) {
+        let clip = NSBezierPath(roundedRect: rect, xRadius: 16, yRadius: 16)
+        NSGraphicsContext.saveGraphicsState()
+        clip.addClip()
+        Glass.sensor.setFill()
+        rect.fill()
         switch photo {
-        case .taken(let image):
-            image.draw(
-                in: rect, from: aspectFillSource(image.size, into: rect.size), operation: .copy, fraction: 1,
-                respectFlipped: true, hints: nil)
-        case .developing, .none:
-            Record.darkroom.setFill()
-            rect.fill()
-            let note: String
-            if case .none = photo { note = "No photo" } else { note = "Taking photo…" }
-            let text = attributed(note, Record.text(rect.width * 0.045, weight: .medium), NSColor.white.withAlphaComponent(0.7))
-            let size = text.size()
-            text.draw(at: NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2))
+        case .taken(let mugshot):
+            let source = aspectFillSource(mugshot.image.size, into: rect.size)
+            mugshot.image.draw(in: rect, from: source, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            if let face = mugshot.face {
+                drawTargetLock(onFace: map(face, from: source, into: rect), confidence: mugshot.confidence, unit: unit)
+            }
+        case .developing:
+            centered("Acquiring image", Glass.mono(unit * 1.2), Glass.tertiary, in: rect)
+        case .none:
+            centered("No image", Glass.mono(unit * 1.2), Glass.tertiary, in: rect)
         }
-        Record.ink.setStroke()
-        let border = NSBezierPath(rect: rect)
-        border.lineWidth = 2
-        border.stroke()
+        NSGraphicsContext.restoreGraphicsState()
+        Glass.panelEdge.setStroke()
+        clip.lineWidth = 1
+        clip.stroke()
+
+        // Frame annotations.
+        let timeFormat = DateFormatter()
+        timeFormat.dateFormat = "HH:mm:ss"
+        mono("CAM 01   \(timeFormat.string(from: booking.date))", Glass.mono(unit * 1.0), Glass.secondary)
+            .draw(at: NSPoint(x: rect.minX + unit * 1.4, y: rect.minY + unit * 1.2))
+        let live = mono("REC", Glass.mono(unit * 1.0, .medium), Glass.secondary)
+        let liveSize = live.size()
+        live.draw(at: NSPoint(x: rect.maxX - unit * 1.4 - liveSize.width, y: rect.minY + unit * 1.2))
+        NSColor.systemRed.setFill()
+        NSBezierPath(ovalIn: NSRect(x: rect.maxX - unit * 2.6 - liveSize.width, y: rect.minY + unit * 1.2 + liveSize.height / 2 - unit * 0.35, width: unit * 0.7, height: unit * 0.7)).fill()
     }
 
-    /// Booking-photo height scale, 4′6″ at the bottom of the frame to 6′6″ at the top.
-    private func drawRuler(beside photo: NSRect, width: CGFloat) {
-        let bottomInches = 54
-        let topInches = 78
-        let font = Record.din(width * 0.3)
-        for inches in bottomInches...topInches {
-            let y = photo.maxY - CGFloat(inches - bottomInches) / CGFloat(topInches - bottomInches) * photo.height
-            let tick: CGFloat = inches % 6 == 0 ? width * 0.45 : (inches % 2 == 0 ? width * 0.25 : width * 0.14)
-            Record.ink.setFill()
-            NSRect(x: photo.minX - tick, y: y - 0.75, width: tick, height: 1.5).fill()
-            guard inches % 6 == 0 else { continue }
-            let rest = inches % 12
-            let label = attributed(rest == 0 ? "\(inches / 12)′" : "\(inches / 12)′\(rest)″", font, Record.ink)
-            let size = label.size()
-            label.draw(at: NSPoint(x: photo.minX - tick - size.width - 6, y: y - size.height / 2))
+    private func drawTargetLock(onFace face: NSRect, confidence: Float, unit: CGFloat) {
+        // Start wide and close in on the face.
+        let spread = (1 - lockProgress) * face.width * 0.35
+        let box = face.insetBy(dx: -face.width * 0.18 - spread, dy: -face.height * 0.18 - spread)
+        let arm = min(box.width, box.height) * 0.18
+        let alpha = 0.35 + 0.65 * lockProgress
+        Glass.lock.withAlphaComponent(alpha).setStroke()
+        let corners = NSBezierPath()
+        corners.lineWidth = 2
+        for (corner, dx, dy) in [
+            (NSPoint(x: box.minX, y: box.minY), 1.0, 1.0), (NSPoint(x: box.maxX, y: box.minY), -1.0, 1.0),
+            (NSPoint(x: box.minX, y: box.maxY), 1.0, -1.0), (NSPoint(x: box.maxX, y: box.maxY), -1.0, -1.0),
+        ] {
+            corners.move(to: NSPoint(x: corner.x + dx * arm, y: corner.y))
+            corners.line(to: corner)
+            corners.line(to: NSPoint(x: corner.x, y: corner.y + dy * arm))
         }
+        corners.stroke()
+        guard lockProgress >= 1 else { return }
+
+        let tag = mono(
+            "SUBJECT \(String(format: "%04d", booking.caseNumber))   \(Int((confidence * 100).rounded()))%",
+            Glass.mono(unit * 1.0, .semibold), NSColor.black)
+        let size = tag.size()
+        let tagRect = NSRect(x: box.minX, y: box.minY - size.height - unit * 0.9, width: size.width + unit * 1.2, height: size.height + unit * 0.5)
+        Glass.lock.setFill()
+        NSBezierPath(roundedRect: tagRect, xRadius: 3, yRadius: 3).fill()
+        tag.draw(at: NSPoint(x: tagRect.minX + unit * 0.6, y: tagRect.minY + unit * 0.25))
     }
 
-    private func drawDetails(in column: NSRect) {
-        let h = bounds.height
-        var y = column.minY
+    // MARK: Readout
 
-        attributed("Charge", Record.text(h * 0.019), Record.label).draw(at: NSPoint(x: column.minX, y: y))
-        y += h * 0.042
-        let chargeFont = fitted("Attempted bagel", Record.dinCondensed, size: h * 0.15, width: column.width)
-        let charge = attributed("Attempted bagel", chargeFont, Record.ink)
-        charge.draw(at: NSPoint(x: column.minX - chargeFont.pointSize * 0.03, y: y))
-        y += charge.size().height + h * 0.02
+    private func drawReadout(in column: NSRect, unit: CGFloat) {
+        var y = column.minY + unit * 0.5
+        let headline = text("Bagel intercepted.", fitted("Bagel intercepted.", size: unit * 6.4, width: column.width), Glass.primary, kern: -unit * 0.12)
+        headline.draw(at: NSPoint(x: column.minX - unit * 0.3, y: y))
+        y += headline.size().height + unit * 0.4
+        let subline = text("Nothing was posted to \(booking.destination).", Glass.display(unit * 2.0, .regular), Glass.secondary)
+        subline.draw(in: NSRect(x: column.minX, y: y, width: column.width, height: unit * 6))
+        y += subline.boundingRect(with: NSSize(width: column.width, height: unit * 6), options: .usesLineFragmentOrigin).height + unit * 3.5
 
-        let date = DateFormatter()
-        date.locale = Locale(identifier: "en_GB")
-        date.dateFormat = "d MMM yyyy, HH:mm"
-        let rows: [(String, String, NSColor)] = [
-            ("Location", booking.destination, Record.ink),
-            ("Date and time", date.string(from: booking.date), Record.ink),
-            ("Evidence", "1 bagel emoji 🥯", Record.ink),
-            ("Outcome", "Removed before sending. Nothing was posted.", Record.alert),
+        let timestamp = DateFormatter()
+        timestamp.locale = Locale(identifier: "en_GB")
+        timestamp.dateFormat = "d MMM yyyy, HH:mm:ss"
+        var rows: [(String, String)] = [
+            ("CLASS", booking.evidence),
+            ("CHANNEL", "Slack, \(booking.destination)"),
         ]
-        // Rows share what is left, so the last rule lines up with the bottom of the photo.
+        if let ms = booking.responseMilliseconds { rows.append(("RESPONSE", "Removed from the message box in \(ms) ms")) }
+        rows.append(("TIME", timestamp.string(from: booking.date)))
+
+        // Rows share what is left, so the last rule lines up with the bottom of the frame.
         let rowHeight = (column.maxY - y) / CGFloat(rows.count)
-        let labelWidth = column.width * 0.26
-        for (label, value, color) in rows {
-            Record.rule.setFill()
+        let labelWidth = column.width * 0.24
+        for (label, value) in rows {
+            Glass.hairline.setFill()
             NSRect(x: column.minX, y: y, width: column.width, height: 1).fill()
-            let labelText = attributed(label, Record.text(h * 0.019), Record.label)
+            let labelText = mono(label, Glass.mono(unit * 1.05, .medium), Glass.tertiary)
             labelText.draw(at: NSPoint(x: column.minX, y: y + rowHeight / 2 - labelText.size().height / 2))
-            let valueFont = fitted(value, Record.din, size: h * 0.03, width: column.width - labelWidth)
-            let valueText = attributed(value, valueFont, color)
-            valueText.draw(at: NSPoint(x: column.minX + labelWidth, y: y + rowHeight / 2 - valueText.size().height / 2))
+            let valueText = text(value, Glass.display(unit * 1.55, .regular), Glass.primary)
+            valueText.draw(
+                with: NSRect(x: column.minX + labelWidth, y: y + rowHeight / 2 - valueText.size().height / 2, width: column.width - labelWidth, height: valueText.size().height),
+                options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
             y += rowHeight
         }
-        Record.rule.setFill()
-        NSRect(x: column.minX, y: y, width: column.width, height: 1).fill()
     }
 
     // MARK: Helpers
 
-    private func attributed(_ string: String, _ font: NSFont, _ color: NSColor) -> NSAttributedString {
-        NSAttributedString(string: string, attributes: [.font: font, .foregroundColor: color])
+    private func text(_ string: String, _ font: NSFont, _ color: NSColor, kern: CGFloat = 0) -> NSAttributedString {
+        NSAttributedString(string: string, attributes: [.font: font, .foregroundColor: color, .kern: kern])
     }
 
-    /// The largest size up to `size` at which `string` fits in `width`.
-    private func fitted(_ string: String, _ font: (CGFloat) -> NSFont, size: CGFloat, width: CGFloat) -> NSFont {
-        let measured = attributed(string, font(size), Record.ink).size().width
-        return measured > width ? font(size * width / measured) : font(size)
+    private func mono(_ string: String, _ font: NSFont, _ color: NSColor) -> NSAttributedString {
+        text(string, font, color, kern: font.pointSize * 0.12)
+    }
+
+    private func centered(_ string: String, _ font: NSFont, _ color: NSColor, in rect: NSRect) {
+        let label = mono(string, font, color)
+        let size = label.size()
+        label.draw(at: NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2))
+    }
+
+    /// The largest light display size up to `size` at which `string` fits in `width`.
+    private func fitted(_ string: String, size: CGFloat, width: CGFloat) -> NSFont {
+        let measured = text(string, Glass.display(size), Glass.primary).size().width
+        return measured > width ? Glass.display(size * width / measured) : Glass.display(size)
     }
 
     private func aspectFillSource(_ image: NSSize, into target: NSSize) -> NSRect {
         let scale = max(target.width / image.width, target.height / image.height)
         let size = NSSize(width: target.width / scale, height: target.height / scale)
         return NSRect(x: (image.width - size.width) / 2, y: (image.height - size.height) / 2, width: size.width, height: size.height)
+    }
+
+    /// Maps a rect in image pixels (top-left origin) to view coordinates for an aspect-fill draw.
+    private func map(_ face: CGRect, from source: NSRect, into dest: NSRect) -> NSRect {
+        let scale = dest.width / source.width
+        return NSRect(
+            x: dest.minX + (face.minX - source.minX) * scale, y: dest.minY + (face.minY - source.minY) * scale,
+            width: face.width * scale, height: face.height * scale)
     }
 }
 
@@ -328,9 +448,9 @@ final class OverlayWindow: NSWindow {
 final class OverlayController {
     private var windows: [OverlayWindow] = []
     private var camera: MugshotCamera?
-    /// Set once the camera has answered: a photo, or nil when there is none.
-    private var capturedPhoto: NSImage??
-    private weak var bookingView: BookingView?
+    /// Set once the camera has answered: a mugshot, or nil when there is none.
+    private var captured: Mugshot??
+    private weak var interdiction: InterdictionView?
     private var booking: Booking?
     private var shownAt = Date.distantPast
 
@@ -340,12 +460,12 @@ final class OverlayController {
     /// their reaction to the overlay.
     func startCamera() {
         camera?.stop()
-        capturedPhoto = nil
+        captured = nil
         let camera = MugshotCamera()
         self.camera = camera
-        camera.snap { [weak self] image in
-            self?.capturedPhoto = .some(image)
-            self?.bookingView?.show(photo: image)
+        camera.snap { [weak self] mugshot in
+            self?.captured = .some(mugshot)
+            self?.interdiction?.show(mugshot)
         }
     }
 
@@ -354,30 +474,44 @@ final class OverlayController {
         closeWindows()
         self.booking = booking
         shownAt = Date()
-        let recordScreen = NSScreen.underMouse
+        let mainScreen = NSScreen.underMouse
         for screen in NSScreen.screens {
             let window = OverlayWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
             window.level = .screenSaver
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
             window.isReleasedWhenClosed = false
+            window.isOpaque = false
+            window.backgroundColor = .clear
             window.onDismiss = { [weak self] in self?.userDismissed() }
-            if screen == recordScreen {
-                let view = BookingView(booking: booking)
-                bookingView = view
-                window.contentView = view
+
+            // Frost whatever is on screen, then draw on top.
+            let frost = NSVisualEffectView()
+            frost.material = .fullScreenUI
+            frost.blendingMode = .behindWindow
+            frost.state = .active
+            frost.appearance = NSAppearance(named: .darkAqua)
+            let content: TintView
+            if screen == mainScreen {
+                let view = InterdictionView(booking: booking)
+                interdiction = view
+                content = view
             } else {
-                window.contentView = BackdropView()
+                content = TintView()
             }
-            window.setFrame(screen.frame, display: true)
+            content.autoresizingMask = [.width, .height]
+            frost.addSubview(content)
+            window.contentView = frost
+            window.setFrame(screen.frame, display: false)
+            content.frame = frost.bounds
             window.makeKeyAndOrderFront(nil)
             windows.append(window)
         }
         NSApp.activate(ignoringOtherApps: true)
 
         if !takePhoto {
-            bookingView?.show(photo: nil)
-        } else if let capturedPhoto {
-            bookingView?.show(photo: capturedPhoto)
+            interdiction?.show(nil)
+        } else if let captured {
+            interdiction?.show(captured)
         } else if camera == nil {
             startCamera()
         }
@@ -390,7 +524,7 @@ final class OverlayController {
         closeWindows()
         camera?.stop()
         camera = nil
-        capturedPhoto = nil
+        captured = nil
         if ending == .lock { Responder.lockScreen() }
     }
 

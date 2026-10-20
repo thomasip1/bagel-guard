@@ -461,30 +461,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // The clear goes through the HID queue to the frontmost app, so give Slack a moment to take
         // it before the overlay pulls focus away. Any Return typed meanwhile queues behind the clear.
-        let clearDelay: TimeInterval
-        if watcher.slackIsFrontmost {
-            Responder.clearFocusedField()
-            clearDelay = 0.15
-        } else {
-            clearDelay = 0
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + clearDelay) { [self] in
-            let destination = Booking.destination(fromField: hit.field)
+        let cleared = watcher.slackIsFrontmost
+        if cleared { Responder.clearFocusedField() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + (cleared ? 0.15 : 0)) { [self] in
+            // Only claim a response time once the box is confirmed empty.
+            let response = cleared && watcher.currentHit() == nil ? Int(Date().timeIntervalSince(now) * 1000) : nil
+            func booking(_ ending: Booking.Ending) -> Booking {
+                Booking(
+                    destination: Booking.destination(fromField: hit.field), evidence: Booking.evidence(fromReason: hit.reason),
+                    caseNumber: Settings.nextCaseNumber(), date: now, responseMilliseconds: response, ending: ending)
+            }
             switch action {
             case .overlayThenLock:
-                overlay.show(booking(to: destination, ending: .lock), takePhoto: Settings.mugshot)
+                overlay.show(booking(.lock), takePhoto: Settings.mugshot)
             case .overlay:
-                overlay.show(booking(to: destination, ending: .close), takePhoto: Settings.mugshot)
+                overlay.show(booking(.close), takePhoto: Settings.mugshot)
             case .lockOnly:
                 Responder.lockScreen()
             case .log:
                 break
             }
         }
-    }
-
-    func booking(to destination: String, ending: Booking.Ending) -> Booking {
-        Booking(destination: destination, caseNumber: Settings.nextCaseNumber(), date: Date(), ending: ending)
     }
 
     // MARK: Menu
@@ -546,7 +543,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func testOverlay() {
-        let preview = Booking(destination: "#office-london", caseNumber: 42, date: Date(), ending: .preview)
+        let preview = Booking(
+            destination: "#office-london", evidence: "bagel emoji", caseNumber: 42, date: Date(), responseMilliseconds: 152,
+            ending: .preview)
         overlay.show(preview, takePhoto: Settings.mugshot)
     }
 
@@ -590,9 +589,26 @@ if let flag = CommandLine.arguments.firstIndex(of: "--render"), CommandLine.argu
     let out = CommandLine.arguments[flag + 1]
     let photo = CommandLine.arguments.count > flag + 2 ? NSImage(contentsOfFile: CommandLine.arguments[flag + 2]) : nil
     let size = NSScreen.main?.frame.size ?? NSSize(width: 1728, height: 1117)
-    let view = BookingView(booking: Booking(destination: "#office-london", caseNumber: 42, date: Date(), ending: .lock))
+    let view = InterdictionView(
+        booking: Booking(
+            destination: "#office-london", evidence: "bagel emoji", caseNumber: 42, date: Date(), responseMilliseconds: 152,
+            ending: .lock))
+    view.paintsBackdrop = true
     view.frame = NSRect(origin: .zero, size: size)
-    if let photo { view.show(photo: photo, quietly: true) } else { view.show(photo: nil) }
+    if let photo, let cgImage = photo.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+        let face = MugshotCamera.face(in: cgImage)
+        view.show(Mugshot(image: NSImage(cgImage: cgImage, size: .zero), face: face?.0, confidence: face?.1 ?? 0), quietly: true)
+    } else {
+        // No photo given: a synthetic sensor frame with a face box, to check the target lock.
+        let frame = NSImage(size: NSSize(width: 1280, height: 720), flipped: true) { rect in
+            NSGradient(starting: NSColor(white: 0.32, alpha: 1), ending: NSColor(white: 0.12, alpha: 1))?.draw(in: rect, angle: 90)
+            NSColor(white: 0.45, alpha: 1).setFill()
+            NSBezierPath(ovalIn: NSRect(x: 520, y: 170, width: 240, height: 300)).fill()
+            NSBezierPath(roundedRect: NSRect(x: 380, y: 500, width: 520, height: 400), xRadius: 200, yRadius: 200).fill()
+            return true
+        }
+        view.show(Mugshot(image: frame, face: CGRect(x: 530, y: 200, width: 220, height: 250), confidence: 0.97), quietly: true)
+    }
     let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
     view.cacheDisplay(in: view.bounds, to: rep)
     try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: out))
