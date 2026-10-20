@@ -34,6 +34,7 @@ struct Booking {
             return reason.replacingOccurrences(of: "emoji image ", with: "").replacingOccurrences(of: "\"", with: "")
         }
         if reason.hasPrefix("shortcode ") { return reason.replacingOccurrences(of: "shortcode ", with: "") + " shortcode" }
+        if reason.hasPrefix("text ") { return "the word " + reason.replacingOccurrences(of: "text ", with: "") }
         return "🥯 U+1F96F"
     }
 }

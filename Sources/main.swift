@@ -110,8 +110,9 @@ enum Detector {
     /// An in-progress or finished shortcode such as `:bagel`, `:hotbagel:`, `:bagel-party-parrot:`.
     static let shortcode = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bagel", options: [.caseInsensitive])
 
-    /// A shortcode on its way to a bagel: `:bag`, `:hotbag`. Used to power the camera up early.
-    static let partialShortcode = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bag", options: [.caseInsensitive])
+    /// A bagel on its way: a shortcode like `:bag` or `:hotbag`, or the word's start, "bage" (plain
+    /// "bag" is too common). Used to power the camera up early.
+    static let partialShortcode = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bag|bage", options: [.caseInsensitive])
 
     static func isTypingBagel(focused: AXUIElement) -> Bool {
         var node: AXUIElement? = focused
@@ -126,11 +127,19 @@ enum Detector {
         return false
     }
 
-    static func scan(text: String) -> String? {
+    /// The word itself, in any case and form: "bagel", "Bagels", "BAGEL TIME".
+    static let word = try! NSRegularExpression(pattern: "bagel", options: [.caseInsensitive])
+
+    /// `plainText` also catches the word; only message boxes use it, so searching Slack for
+    /// "bagel" doesn't lock the Mac.
+    static func scan(text: String, plainText: Bool = false) -> String? {
         if text.contains("\u{1F96F}") { return "unicode 🥯" }
         let range = NSRange(text.startIndex..., in: text)
         if let match = shortcode.firstMatch(in: text, range: range), let r = Range(match.range, in: text) {
             return "shortcode \(text[r])"
+        }
+        if plainText, let match = word.firstMatch(in: text, range: range), let r = Range(match.range, in: text) {
+            return "text \"\(text[r])\""
         }
         return nil
     }
@@ -164,7 +173,7 @@ enum Detector {
             let label: String = axAttr(current, kAXDescriptionAttribute) ?? axAttr(current, kAXTitleAttribute) ?? ""
             let value: String = axAttr(current, kAXValueAttribute) ?? ""
             if role == kAXTextAreaRole {
-                if let reason = scan(text: value) ?? scanImages(in: current) {
+                if let reason = scan(text: value, plainText: true) ?? scanImages(in: current) {
                     return Hit(reason: reason, field: label)
                 }
                 return nil
