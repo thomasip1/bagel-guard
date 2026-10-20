@@ -267,8 +267,6 @@ final class InterdictionView: TintView {
         case .preview: next = "Preview. Click anywhere to close."
         }
         text(next, Glass.display(unit * 1.6, .medium), Glass.primary).draw(at: NSPoint(x: inner.minX, y: footerY - unit * 0.6))
-        let privacy = text("The photo stays on this screen and is never saved.", Glass.display(unit * 1.3, .regular), Glass.tertiary)
-        privacy.draw(at: NSPoint(x: inner.maxX - privacy.size().width, y: footerY - unit * 0.35))
 
         // Body: sensor frame on the left, readout on the right.
         let bodyTop = inner.minY + unit * 4.5
