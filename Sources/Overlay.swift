@@ -1,6 +1,6 @@
 // The overlay: a frosted-glass interdiction screen. The webcam photo is taken the moment the bagel
 // is detected, the face in it is located with Vision, and a target lock is drawn on it. Each caught
-// attempt is saved to ~/Pictures/BagelGuard as a redrawn copy of the overlay.
+// attempt is saved to ~/Pictures/BagelGuard: the bare photo and a redrawn copy of the overlay.
 
 import AVFoundation
 import Cocoa
@@ -63,20 +63,25 @@ enum MugshotArchive {
 
     /// Redraws the overlay off-screen (the frosted screen behind it becomes a dark backdrop, so no
     /// Screen Recording permission is needed and nothing behind the overlay is captured) and writes
-    /// it as e.g. "2026-10-20 15.48.53 case 0042 office-london.jpg".
+    /// it alongside the bare photo, as e.g. "2026-10-20 15.48.53 case 0042 office-london screen.jpg"
+    /// and "… photo.jpg".
     static func save(_ mugshot: Mugshot, for booking: Booking) {
-        guard let bitmap = render(mugshot, for: booking) else { return }
-
+        guard let screen = render(mugshot, for: booking),
+            let photo = mugshot.image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        else { return }
         let stamp = DateFormatter()
         stamp.dateFormat = "yyyy-MM-dd HH.mm.ss"
         let place = booking.destination.replacingOccurrences(of: "#", with: "")
             .components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ ")).inverted).joined()
-        let name = "\(stamp.string(from: booking.date)) case \(String(format: "%04d", booking.caseNumber)) \(place).jpg"
+        let base = "\(stamp.string(from: booking.date)) case \(String(format: "%04d", booking.caseNumber)) \(place)"
+        let files = [("\(base) screen.jpg", screen), ("\(base) photo.jpg", NSBitmapImageRep(cgImage: photo))]
         DispatchQueue.global(qos: .utility).async {
             do {
                 try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-                try bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.9])?.write(to: folder.appendingPathComponent(name))
-                Log.write("saved \(name)")
+                for (name, bitmap) in files {
+                    try bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.9])?.write(to: folder.appendingPathComponent(name))
+                }
+                Log.write("saved \(base) (screen + photo)")
             } catch {
                 Log.write("could not save mugshot: \(error)")
             }
