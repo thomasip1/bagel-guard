@@ -101,15 +101,31 @@ final class MugshotCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     private let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "com.thomasip.bagelguard.camera")
+    /// Shared, and warmed up at launch: the first render on a new context costs ~0.2 s.
+    private static let context = CIContext()
+    private var context: CIContext { Self.context }
+
+    static func warmUp() {
+        let pixel = CIImage(color: .gray).cropped(to: CGRect(x: 0, y: 0, width: 8, height: 8))
+        _ = context.createCGImage(pixel.applyingFilter("CIExposureAdjust"), from: pixel.extent)
+    }
     private var completion: ((Mugshot?) -> Void)?
-    private var firstFrameAt: Date?  // only touched on `queue`
+    private var onFace: ((CGRect, Float) -> Void)?
+    private(set) var firstFrameAt: Date?  // only touched on `queue` until the photo is delivered
+    /// Tuning knobs, read from defaults so they can be measured without rebuilding.
+    static var settle: TimeInterval { UserDefaults.standard.object(forKey: "cameraSettle") as? Double ?? 0.1 }
+    static var preset: AVCaptureSession.Preset {
+        AVCaptureSession.Preset(rawValue: UserDefaults.standard.string(forKey: "cameraPreset") ?? AVCaptureSession.Preset.high.rawValue)
+    }
     private var grabbed = false  // only touched on `queue`
 
-    func snap(_ completion: @escaping (Mugshot?) -> Void) {
+    /// Calls `completion` with the photo as soon as there is one, then `onFace` if Vision finds a
+    /// face in it.
+    func snap(_ completion: @escaping (Mugshot?) -> Void, onFace: @escaping (CGRect, Float) -> Void = { _, _ in }) {
         guard Self.isAuthorized, let device = AVCaptureDevice.default(for: .video),
             let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input)
         else { return completion(nil) }
-        session.sessionPreset = .high
+        session.sessionPreset = Self.preset
         session.addInput(input)
         let output = AVCaptureVideoDataOutput()
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
@@ -117,41 +133,53 @@ final class MugshotCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard session.canAddOutput(output) else { return completion(nil) }
         session.addOutput(output)
         self.completion = completion
+        self.onFace = onFace
         queue.async { [session] in session.startRunning() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in self?.deliver(nil) }
     }
 
     func stop() {
         completion = nil
+        onFace = nil
         queue.async { [session] in session.stopRunning() }
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard !grabbed, let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        // The MacBook camera's first frame is nearly black and exposure keeps rising for a while
+        // The MacBook camera's first frame is nearly black, and exposure keeps rising for seconds
         // after it (isAdjustingExposure always reads false, so it can't be trusted). Measured: first
-        // frame ~0.75 s after start at brightness 8/255, ~76 by 0.45 s later, ~83 after 3 s.
+        // frame 0.5-0.75 s after start at brightness 8-13/255, then ~62 a tenth of a second later,
+        // ~83 after 3 s. So take a frame 0.1 s in and lift its exposure instead of waiting.
         let now = Date()
         if firstFrameAt == nil { firstFrameAt = now }
-        guard now.timeIntervalSince(firstFrameAt!) >= 0.45 else { return }
+        guard now.timeIntervalSince(firstFrameAt!) >= Self.settle else { return }
         grabbed = true
-        // Even out what exposure hasn't caught up on, then the cool, low-saturation sensor look.
         var image = CIImage(cvPixelBuffer: buffer)
-        for filter in image.autoAdjustmentFilters(options: [.redEye: false]) {
-            filter.setValue(image, forKey: kCIInputImageKey)
-            image = filter.outputImage ?? image
-        }
+        let lift = log2(Self.targetBrightness / max(brightness(of: image), 1))
         image = image
+            .applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: min(1.5, max(0, lift))])
             .applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0.2])
             .applyingFilter("CITemperatureAndTint", parameters: ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 7600, y: 0)])
-        guard let cgImage = CIContext().createCGImage(image, from: image.extent) else {
+        guard let cgImage = context.createCGImage(image, from: image.extent) else {
             return DispatchQueue.main.async { self.deliver(nil) }
         }
-        let face = Self.face(in: cgImage)
-        let mugshot = Mugshot(
-            image: NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height)),
-            face: face?.0, confidence: face?.1 ?? 0)
-        DispatchQueue.main.async { self.deliver(mugshot) }
+        // Show the photo first; the face lock follows once Vision is done.
+        let photo = Mugshot(image: NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height)), face: nil, confidence: 0)
+        DispatchQueue.main.async { self.deliver(photo) }
+        if let (face, confidence) = Self.face(in: cgImage) {
+            DispatchQueue.main.async { self.onFace?(face, confidence) }
+        }
+    }
+
+    /// Average brightness of a well-exposed indoor webcam frame, on a 0-255 scale.
+    static let targetBrightness = 105.0
+
+    /// Average luma, 0-255.
+    func brightness(of image: CIImage) -> Double {
+        var pixel = [UInt8](repeating: 0, count: 4)
+        let average = image.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: image.extent)])
+        context.render(average, toBitmap: &pixel, rowBytes: 4, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBA8, colorSpace: nil)
+        return 0.299 * Double(pixel[0]) + 0.587 * Double(pixel[1]) + 0.114 * Double(pixel[2])
     }
 
     private func deliver(_ mugshot: Mugshot?) {
@@ -211,13 +239,23 @@ final class InterdictionView: TintView {
             photo = .none
             return
         }
+        var hadPhoto = false
+        if case .taken = photo { hadPhoto = true }
         photo = .taken(mugshot)
         guard !quietly else { return }
+        if !hadPhoto { playShutter() }
+        guard mugshot.face != nil, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        animateLock()
+    }
+
+    private func playShutter() {
         NSSound(
             contentsOfFile: "/System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/Shutter.aif",
             byReference: true)?.play()
-        guard mugshot.face != nil, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
-        // The one animation: the target lock closes in on the face.
+    }
+
+    /// The one animation: the target lock closes in on the face.
+    private func animateLock() {
         lockProgress = 0
         let start = Date()
         lockTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] timer in
@@ -447,34 +485,55 @@ final class OverlayWindow: NSWindow {
 
 final class OverlayController {
     private var windows: [OverlayWindow] = []
+    private var views: [InterdictionView] = []
     private var camera: MugshotCamera?
     /// Set once the camera has answered: a mugshot, or nil when there is none.
     private var captured: Mugshot??
-    private weak var interdiction: InterdictionView?
+    private var prewarmTimeout: Timer?
     private var booking: Booking?
     private var shownAt = Date.distantPast
 
     var isShowing: Bool { !windows.isEmpty }
 
-    /// Starts the camera straight away, so the photo is of the person at the keyboard rather than of
-    /// their reaction to the overlay.
+    /// Starts the camera, unless it is already running, so the photo is of the person at the
+    /// keyboard rather than of their reaction to the overlay.
     func startCamera() {
-        camera?.stop()
+        prewarmTimeout?.invalidate()
+        guard camera == nil else { return }
         captured = nil
         let camera = MugshotCamera()
         self.camera = camera
-        camera.snap { [weak self] mugshot in
-            self?.captured = .some(mugshot)
-            self?.interdiction?.show(mugshot)
+        camera.snap(
+            { [weak self] mugshot in
+                self?.captured = .some(mugshot)
+                self?.views.forEach { $0.show(mugshot) }
+            },
+            onFace: { [weak self] face, confidence in
+                guard let self, case .some(.some(let photo)) = self.captured else { return }
+                let locked = Mugshot(image: photo.image, face: face, confidence: confidence)
+                self.captured = .some(locked)
+                self.views.forEach { $0.show(locked) }
+            })
+    }
+
+    /// Powers the camera up while a bagel shortcode is still being typed. If no bagel follows
+    /// within 3 s, the camera stops and any photo it took is dropped.
+    func prewarmCamera() {
+        guard !isShowing, camera == nil else { return }
+        startCamera()
+        prewarmTimeout = Timer.scheduledTimer(withTimeInterval: 3, repeats: false) { [weak self] _ in
+            guard let self, !self.isShowing else { return }
+            self.discardCamera()
         }
     }
 
-    /// Stays up until a click or key press, then locks or just closes, as the booking says.
+    /// Covers every screen with the record. Stays up until a click or key press, then locks or
+    /// just closes, as the booking says.
     func show(_ booking: Booking, takePhoto: Bool) {
         closeWindows()
+        prewarmTimeout?.invalidate()
         self.booking = booking
         shownAt = Date()
-        let mainScreen = NSScreen.underMouse
         for screen in NSScreen.screens {
             let window = OverlayWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
             window.level = .screenSaver
@@ -490,29 +549,23 @@ final class OverlayController {
             frost.blendingMode = .behindWindow
             frost.state = .active
             frost.appearance = NSAppearance(named: .darkAqua)
-            let content: TintView
-            if screen == mainScreen {
-                let view = InterdictionView(booking: booking)
-                interdiction = view
-                content = view
-            } else {
-                content = TintView()
-            }
-            content.autoresizingMask = [.width, .height]
-            frost.addSubview(content)
+            let view = InterdictionView(booking: booking)
+            view.autoresizingMask = [.width, .height]
+            frost.addSubview(view)
             window.contentView = frost
             window.setFrame(screen.frame, display: false)
-            content.frame = frost.bounds
+            view.frame = frost.bounds
             window.makeKeyAndOrderFront(nil)
             windows.append(window)
+            views.append(view)
         }
         NSApp.activate(ignoringOtherApps: true)
 
         if !takePhoto {
-            interdiction?.show(nil)
+            views.forEach { $0.show(nil) }
         } else if let captured {
-            interdiction?.show(captured)
-        } else if camera == nil {
+            views.forEach { $0.show(captured) }
+        } else {
             startCamera()
         }
     }
@@ -522,14 +575,19 @@ final class OverlayController {
         guard Date().timeIntervalSince(shownAt) > 1 else { return }
         let ending = booking?.ending
         closeWindows()
+        discardCamera()
+        if ending == .lock { Responder.lockScreen() }
+    }
+
+    private func discardCamera() {
         camera?.stop()
         camera = nil
         captured = nil
-        if ending == .lock { Responder.lockScreen() }
     }
 
     private func closeWindows() {
         windows.forEach { $0.orderOut(nil) }
         windows = []
+        views = []
     }
 }

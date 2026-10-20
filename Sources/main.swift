@@ -110,6 +110,22 @@ enum Detector {
     /// An in-progress or finished shortcode such as `:bagel`, `:hotbagel:`, `:bagel-party-parrot:`.
     static let shortcode = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bagel", options: [.caseInsensitive])
 
+    /// A shortcode on its way to a bagel: `:bag`, `:hotbag`. Used to power the camera up early.
+    static let partialShortcode = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bag", options: [.caseInsensitive])
+
+    static func isTypingBagel(focused: AXUIElement) -> Bool {
+        var node: AXUIElement? = focused
+        for _ in 0..<6 {
+            guard let current = node else { break }
+            if (axAttr(current, kAXRoleAttribute) as String?) == kAXTextAreaRole {
+                let value: String = axAttr(current, kAXValueAttribute) ?? ""
+                return partialShortcode.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
+            }
+            node = axElement(current, kAXParentAttribute)
+        }
+        return false
+    }
+
     static func scan(text: String) -> String? {
         if text.contains("\u{1F96F}") { return "unicode 🥯" }
         let range = NSRange(text.startIndex..., in: text)
@@ -171,6 +187,7 @@ final class SlackWatcher {
     private var observer: AXObserver?
     private var pollTimer: Timer?
     var onHit: ((Hit, String) -> Void)?
+    var onApproach: (() -> Void)?
 
     func start() {
         let center = NSWorkspace.shared.notificationCenter
@@ -258,8 +275,12 @@ final class SlackWatcher {
     }
 
     func check(source: String) {
-        guard Settings.armed, let hit = currentHit() else { return }
-        onHit?(hit, source)
+        guard Settings.armed, let app, let focused = axElement(app, kAXFocusedUIElementAttribute) else { return }
+        if let hit = Detector.check(focused: focused) {
+            onHit?(hit, source)
+        } else if Detector.isTypingBagel(focused: focused) {
+            onApproach?()
+        }
     }
 }
 
@@ -417,6 +438,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshIcon()
 
         watcher.onHit = { [weak self] hit, source in self?.trigger(hit, source: source) }
+        watcher.onApproach = { [weak self] in
+            guard let self, Settings.mugshot, [.overlayThenLock, .overlay].contains(Settings.action) else { return }
+            self.overlay.prewarmCamera()
+        }
         interceptor.onBlocked = { [weak self] hit, source in
             // Called from inside the event tap; respond after the tap returns.
             DispatchQueue.main.async { self?.trigger(hit, source: source, blockedSend: true) }
@@ -442,7 +467,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         watcher.start()
         interceptor.start()
         refreshIcon()
-        if Settings.mugshot { MugshotCamera.requestAccessIfNeeded() }
+        if Settings.mugshot {
+            MugshotCamera.requestAccessIfNeeded()
+            DispatchQueue.global(qos: .utility).async { MugshotCamera.warmUp() }
+        }
         if CommandLine.arguments.contains("--preview") { testOverlay() }
     }
 

@@ -16,6 +16,7 @@ final class CameraProbe: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
     /// Takes one photo exactly as a detection would, and logs how long it took and how bright it is.
     static func snapTest() {
         _ = NSApplication.shared
+        MugshotCamera.warmUp()
         let start = Date()
         var done = false
         let camera = MugshotCamera()
@@ -29,7 +30,9 @@ final class CameraProbe: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             let average = image.applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: image.extent)])
             CIContext().render(average, toBitmap: &pixel, rowBytes: 4, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBA8, colorSpace: nil)
             let luma = 0.299 * Double(pixel[0]) + 0.587 * Double(pixel[1]) + 0.114 * Double(pixel[2])
-            Log.write(String(format: "snap-test: photo after %.2f s, luma=%.0f, face=%@", Date().timeIntervalSince(start), luma,
+            let firstFrame = camera.firstFrameAt.map { $0.timeIntervalSince(start) } ?? -1
+            Log.write(String(format: "snap-test: preset=%@ settle=%.2f first frame %.2f s, photo %.2f s, luma=%.0f, face=%@",
+                             MugshotCamera.preset.rawValue, MugshotCamera.settle, firstFrame, Date().timeIntervalSince(start), luma,
                              mugshot.face.map { "\(Int($0.width))px" } ?? "none"))
         }
         while !done && Date().timeIntervalSince(start) < 6 { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
