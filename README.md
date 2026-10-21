@@ -2,18 +2,34 @@
 
 A macOS menu-bar app that stops the "bagel on an unlocked laptop" prank in Slack.
 
+![BagelGuard overlay](screenshot.jpg)
+
 When someone puts a bagel into a Slack message box on your Mac (the 🥯 emoji, a `:bagel:`-style
 shortcode, one of the custom bagel emoji, or the word "bagel"), BagelGuard:
 
 1. clears the message box before it can be sent,
 2. takes a webcam photo of whoever is at the keyboard,
-3. covers every screen with an overlay showing the photo, what was caught and where,
-4. saves the photo and a copy of the overlay to `~/Pictures/BagelGuard`, and
-5. locks the screen when the overlay is clicked.
+3. identifies them against a lineup of known faces,
+4. covers every screen with an overlay showing the photo, who they are, what was caught and where,
+5. saves the photo and a copy of the overlay to `~/Pictures/BagelGuard`, and
+6. locks the screen when the overlay is clicked.
+
+It also intercepts the Return key and clicks on the Send button while a bagel is in the message box,
+so even if detection is a frame behind, the message never goes out.
 
 Reactions are not caught. The menu (🥯 in the menu bar) lets you disarm it, choose what happens on
 a catch (overlay then lock, overlay only, lock right away, or only log it), turn the photo off,
 preview the overlay, and start it at login.
+
+## Face lineup
+
+Drop photos into `~/Pictures/BagelGuard/Lineup/` named `Firstname Lastname.jpg`. At launch,
+BagelGuard indexes every face using the SFace model (112x112 aligned embeddings, cosine similarity
+threshold 0.363). When a mugshot is caught, the face is matched against the lineup and the overlay
+shows who it is.
+
+If a `-linkedin` variant exists (e.g. `Oliver Stanley-linkedin.jpg` alongside `Oliver Stanley.jpg`),
+the LinkedIn version is preferred for indexing.
 
 ## Install
 
