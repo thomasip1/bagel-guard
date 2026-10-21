@@ -239,6 +239,10 @@ final class SlackWatcher {
     /// The last report, so each attempt (or approach) is reported once rather than on every check.
     private var reported: Hit?
     private var reportedApproach = false
+    /// When a bagel (or approaching text) was last seen in the focused field. The send interceptor
+    /// uses this to block Enter during the AX tree gap when Slack's autocomplete replaces a shortcode
+    /// with an emoji image — currentHit() briefly returns nil even though a bagel just arrived.
+    private(set) var lastSightingDate: Date?
     var onHit: ((Hit, String) -> Void)?
     var onApproach: (() -> Void)?
 
@@ -344,12 +348,14 @@ final class SlackWatcher {
         guard Settings.armed else { return }
         let observation = observeFocused()
         if case .approaching = observation {
+            lastSightingDate = Date()
             if !reportedApproach { onApproach?() }
             reportedApproach = true
         } else {
             reportedApproach = false
         }
         if case .bagel(let hit) = observation {
+            lastSightingDate = Date()
             guard hit != reported else { return }
             reported = hit
             onHit?(hit, source)
@@ -404,18 +410,34 @@ final class SendInterceptor {
 
         if type == .keyDown {
             let key = Int(event.getIntegerValueField(.keyboardEventKeycode))
-            guard key == kVK_Return || key == kVK_ANSI_KeypadEnter, watcher.slackIsFrontmost,
-                let hit = watcher.currentHit()
+            guard key == kVK_Return || key == kVK_ANSI_KeypadEnter, watcher.slackIsFrontmost
             else { return pass }
-            onBlocked?(hit, "return key")
-            return nil
+            // Re-scan now; if clean, check whether a bagel was sighted very recently (covers the
+            // AX-tree gap when Slack's autocomplete swaps a shortcode for an emoji image).
+            if let hit = watcher.currentHit() {
+                onBlocked?(hit, "return key")
+                return nil
+            }
+            if let last = watcher.lastSightingDate, Date().timeIntervalSince(last) < 1.5 {
+                let stale = Hit(evidence: .shortcode(":bagel-like:"), field: "(recent)")
+                onBlocked?(stale, "return key (recent sighting)")
+                return nil
+            }
+            return pass
         }
 
         if type == .leftMouseDown, windowOwner(under: event) ?? slackPid == slackPid,
-            clickIsOnSendButton(event.location, slackPid: slackPid), let hit = watcher.currentHit()
+            clickIsOnSendButton(event.location, slackPid: slackPid)
         {
-            onBlocked?(hit, "send button")
-            return nil
+            if let hit = watcher.currentHit() {
+                onBlocked?(hit, "send button")
+                return nil
+            }
+            if let last = watcher.lastSightingDate, Date().timeIntervalSince(last) < 1.5 {
+                let stale = Hit(evidence: .shortcode(":bagel-like:"), field: "(recent)")
+                onBlocked?(stale, "send button (recent sighting)")
+                return nil
+            }
         }
         return pass
     }
@@ -568,7 +590,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Menu
 
     func refreshIcon() {
-        statusItem.button?.title = "🥯"
+        if let iconPath = Bundle.main.path(forResource: "MenuBarIcon", ofType: "png"),
+           let image = NSImage(contentsOfFile: iconPath)
+        {
+            image.isTemplate = false
+            image.size = NSSize(width: 18, height: 18)
+            statusItem.button?.image = image
+            statusItem.button?.title = ""
+        } else {
+            statusItem.button?.title = "🥯"
+        }
         statusItem.button?.alphaValue = Settings.armed ? 1 : 0.4
         statusItem.button?.toolTip = "BagelGuard (\(Settings.armed ? "armed" : "disarmed"))"
     }

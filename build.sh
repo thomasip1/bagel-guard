@@ -18,6 +18,12 @@ mkdir -p "$APP/Contents/Resources"
 if [ -d Models/SFace.mlpackage ]; then
     cp -R Models/SFace.mlpackage "$APP/Contents/Resources/"
 fi
+if [ -f Resources/BagelGuard.icns ]; then
+    cp Resources/BagelGuard.icns "$APP/Contents/Resources/"
+fi
+if [ -f Resources/MenuBarIcon.png ]; then
+    cp Resources/MenuBarIcon.png "$APP/Contents/Resources/"
+fi
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -31,6 +37,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleShortVersionString</key><string>0.1</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>CFBundleIconFile</key><string>BagelGuard</string>
     <key>LSUIElement</key><true/>
     <key>NSCameraUsageDescription</key><string>BagelGuard takes a mugshot of whoever tries to post a bagel. Each attempt is shown on screen and saved to Pictures/BagelGuard.</string>
 </dict>
