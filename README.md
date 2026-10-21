@@ -28,7 +28,7 @@ BagelGuard indexes every face using the SFace model (112x112 aligned embeddings,
 threshold 0.363). When a mugshot is caught, the face is matched against the lineup and the overlay
 shows who it is.
 
-If a `-linkedin` variant exists (e.g. `Oliver Stanley-linkedin.jpg` alongside `Oliver Stanley.jpg`),
+If a `-linkedin` variant exists (e.g. `Jane Doe-linkedin.jpg` alongside `Jane Doe.jpg`),
 the LinkedIn version is preferred for indexing.
 
 ## Install
