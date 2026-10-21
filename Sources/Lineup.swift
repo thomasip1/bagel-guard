@@ -56,9 +56,19 @@ final class Lineup {
         guard let files = try? fm.contentsOfDirectory(at: Self.folder, includingPropertiesForKeys: nil) else { return }
         let images = files.filter { ["jpg", "jpeg", "png", "heic"].contains($0.pathExtension.lowercased()) }
 
-        var indexed: [(String, [Float])] = []
+        // Prefer "-linkedin" variant when present (better quality headshot).
+        var bestURL: [String: URL] = [:]
         for url in images {
-            let name = url.deletingPathExtension().lastPathComponent
+            let filename = url.deletingPathExtension().lastPathComponent
+            let isLinkedIn = filename.hasSuffix("-linkedin")
+            let baseName = isLinkedIn ? String(filename.dropLast("-linkedin".count)) : filename
+            if isLinkedIn || bestURL[baseName] == nil {
+                bestURL[baseName] = url
+            }
+        }
+
+        var indexed: [(String, [Float])] = []
+        for (name, url) in bestURL.sorted(by: { $0.key < $1.key }) {
             guard let image = NSImage(contentsOf: url),
                   let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
             else {

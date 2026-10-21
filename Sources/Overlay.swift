@@ -36,10 +36,17 @@ struct Booking {
         for prefix in ["Message to ", "Reply to thread in "] where name.hasPrefix(prefix) {
             name = String(name.dropFirst(prefix.count))
         }
-        name = name.trimmingCharacters(in: .whitespaces)
+        name = unescape(name.trimmingCharacters(in: .whitespaces))
         if name.isEmpty { return "Slack" }
-        // Channel names have no spaces; people's names usually do.
         return name.contains(" ") ? name : "#\(name)"
+    }
+
+    private static func unescape(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\'", with: "'")
+         .replacingOccurrences(of: "\\\"", with: "\"")
+         .replacingOccurrences(of: "&#39;", with: "'")
+         .replacingOccurrences(of: "&apos;", with: "'")
+         .replacingOccurrences(of: "&amp;", with: "&")
     }
 }
 
@@ -447,9 +454,11 @@ final class InterdictionView: TintView {
         var y = column.minY + unit * 0.5
         let matchName: String? = if case .taken(let m) = photo { m.match?.name } else { nil }
         let headlineText = matchName.map { "Nice try \($0)." } ?? "Bagel intercepted."
-        let headline = text(headlineText, fitted(headlineText, size: unit * 6.4, width: column.width), Glass.primary, kern: -unit * 0.12)
-        headline.draw(at: NSPoint(x: column.minX - unit * 0.3, y: y))
-        y += headline.size().height + unit * 0.4
+        let headline = text(headlineText, Glass.display(unit * 6.4), Glass.primary, kern: -unit * 0.12)
+        let headlineWidth = column.width + unit * 0.3
+        let headlineRect = NSRect(x: column.minX - unit * 0.3, y: y, width: headlineWidth, height: unit * 20)
+        headline.draw(with: headlineRect, options: .usesLineFragmentOrigin)
+        y += headline.boundingRect(with: NSSize(width: headlineWidth, height: .greatestFiniteMagnitude), options: .usesLineFragmentOrigin).height + unit * 0.4
         let subline = text(
             matchName != nil ? "Bagel attempt intercepted." : "Nothing was posted to \(booking.destination).",
             Glass.display(unit * 2.0, .regular), Glass.secondary)
@@ -470,10 +479,12 @@ final class InterdictionView: TintView {
             let labelText = mono(label, Glass.mono(unit * 1.05, .medium), Glass.tertiary)
             labelText.draw(at: NSPoint(x: column.minX, y: y + rowHeight / 2 - labelText.size().height / 2))
             let valueText = text(value, Glass.display(unit * 1.55, .regular), Glass.primary)
-            let valueHeight = valueText.size().height
+            let valueWidth = column.width - labelWidth
+            let valueNatural = valueText.boundingRect(with: NSSize(width: valueWidth, height: .greatestFiniteMagnitude), options: .usesLineFragmentOrigin).height
+            let valueY = y + (rowHeight - min(valueNatural, rowHeight)) / 2
             valueText.draw(
-                with: NSRect(x: column.minX + labelWidth, y: y + rowHeight / 2 - valueHeight / 2, width: column.width - labelWidth, height: valueHeight),
-                options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+                with: NSRect(x: column.minX + labelWidth, y: valueY, width: valueWidth, height: rowHeight),
+                options: .usesLineFragmentOrigin)
             y += rowHeight
         }
     }
