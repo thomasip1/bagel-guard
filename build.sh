@@ -14,6 +14,11 @@ mkdir -p "$APP/Contents/MacOS"
 swiftc -O -swift-version 5 -target arm64-apple-macos14 \
     -o "$APP/Contents/MacOS/BagelGuard" Sources/*.swift
 
+mkdir -p "$APP/Contents/Resources"
+if [ -d Models/SFace.mlpackage ]; then
+    cp -R Models/SFace.mlpackage "$APP/Contents/Resources/"
+fi
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

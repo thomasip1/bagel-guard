@@ -51,7 +51,9 @@ struct Face {
 
 struct Mugshot {
     let image: NSImage
+    var rawImage: CGImage?
     var face: Face?
+    var match: LineupMatch?
 }
 
 enum Formats {
@@ -92,7 +94,8 @@ enum MugshotArchive {
         else { return }
         let place = booking.destination.replacingOccurrences(of: "#", with: "")
             .components(separatedBy: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_ ")).inverted).joined()
-        let base = "\(Formats.fileStamp.string(from: booking.date)) case \(booking.caseLabel) \(place)"
+        let who = mugshot.match.map { " \($0.name)" } ?? ""
+        let base = "\(Formats.fileStamp.string(from: booking.date)) case \(booking.caseLabel) \(place)\(who)"
         let files = [("\(base) screen.jpg", screen), ("\(base) photo.jpg", NSBitmapImageRep(cgImage: photo))]
         DispatchQueue.global(qos: .utility).async {
             do {
@@ -221,15 +224,15 @@ final class MugshotCamera: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         grabbed = true
         var image = CIImage(cvPixelBuffer: buffer)
         let lift = log2(Self.targetBrightness / max(Self.brightness(of: image), 1))
-        image = image
-            .applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: min(1.5, max(0, lift))])
+        let exposed = image.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: min(1.5, max(0, lift))])
+        let rawCG = Self.context.createCGImage(exposed, from: exposed.extent)
+        image = exposed
             .applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0.2])
             .applyingFilter("CITemperatureAndTint", parameters: ["inputNeutral": CIVector(x: 6500, y: 0), "inputTargetNeutral": CIVector(x: 7600, y: 0)])
         guard let cgImage = Self.context.createCGImage(image, from: image.extent) else {
             return DispatchQueue.main.async { self.deliver(nil) }
         }
-        // Show the photo first; the face lock follows once Vision is done.
-        let photo = Mugshot(image: NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height)))
+        let photo = Mugshot(image: NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height)), rawImage: rawCG)
         DispatchQueue.main.async { self.deliver(photo) }
         let face = Self.face(in: cgImage)
         DispatchQueue.main.async { self.onAnalyzed?(face) }
@@ -383,7 +386,7 @@ final class InterdictionView: TintView {
             let source = aspectFillSource(mugshot.image.size, into: rect.size)
             mugshot.image.draw(in: rect, from: source, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
             if let face = mugshot.face {
-                drawTargetLock(onFace: map(face.rect, from: source, into: rect), confidence: face.confidence, unit: unit)
+                drawTargetLock(onFace: map(face.rect, from: source, into: rect), confidence: face.confidence, match: mugshot.match, unit: unit)
             }
         case .developing:
             centered("Acquiring image", Glass.mono(unit * 1.2), Glass.tertiary, in: rect)
@@ -405,7 +408,7 @@ final class InterdictionView: TintView {
         NSBezierPath(ovalIn: NSRect(x: rect.maxX - unit * 2.6 - liveSize.width, y: rect.minY + unit * 1.2 + liveSize.height / 2 - unit * 0.35, width: unit * 0.7, height: unit * 0.7)).fill()
     }
 
-    private func drawTargetLock(onFace face: NSRect, confidence: Float, unit: CGFloat) {
+    private func drawTargetLock(onFace face: NSRect, confidence: Float, match: LineupMatch?, unit: CGFloat) {
         // Start wide and close in on the face.
         let spread = (1 - lockProgress) * face.width * 0.35
         let box = face.insetBy(dx: -face.width * 0.18 - spread, dy: -face.height * 0.18 - spread)
@@ -424,7 +427,13 @@ final class InterdictionView: TintView {
         corners.stroke()
         guard lockProgress >= 1 else { return }
 
-        let tag = mono("SUBJECT \(booking.caseLabel)   \(Int((confidence * 100).rounded()))%", Glass.mono(unit * 1.0, .semibold), NSColor.black)
+        let label: String
+        if let match {
+            label = "\(match.name.uppercased())   \(Int((match.similarity * 100).rounded()))%"
+        } else {
+            label = "SUBJECT \(booking.caseLabel)   \(Int((confidence * 100).rounded()))%"
+        }
+        let tag = mono(label, Glass.mono(unit * 1.0, .semibold), NSColor.black)
         let size = tag.size()
         let tagRect = NSRect(x: box.minX, y: box.minY - size.height - unit * 0.9, width: size.width + unit * 1.2, height: size.height + unit * 0.5)
         Glass.lock.setFill()
@@ -436,10 +445,14 @@ final class InterdictionView: TintView {
 
     private func drawReadout(in column: NSRect, unit: CGFloat) {
         var y = column.minY + unit * 0.5
-        let headline = text("Bagel intercepted.", fitted("Bagel intercepted.", size: unit * 6.4, width: column.width), Glass.primary, kern: -unit * 0.12)
+        let matchName: String? = if case .taken(let m) = photo { m.match?.name } else { nil }
+        let headlineText = matchName.map { "Nice try \($0)." } ?? "Bagel intercepted."
+        let headline = text(headlineText, fitted(headlineText, size: unit * 6.4, width: column.width), Glass.primary, kern: -unit * 0.12)
         headline.draw(at: NSPoint(x: column.minX - unit * 0.3, y: y))
         y += headline.size().height + unit * 0.4
-        let subline = text("Nothing was posted to \(booking.destination).", Glass.display(unit * 2.0, .regular), Glass.secondary)
+        let subline = text(
+            matchName != nil ? "Bagel attempt intercepted." : "Nothing was posted to \(booking.destination).",
+            Glass.display(unit * 2.0, .regular), Glass.secondary)
         let sublineRect = NSRect(x: column.minX, y: y, width: column.width, height: unit * 6)
         subline.draw(in: sublineRect)
         y += subline.boundingRect(with: sublineRect.size, options: .usesLineFragmentOrigin).height + unit * 3.5
@@ -550,6 +563,9 @@ final class OverlayController {
             onAnalyzed: { [weak self] face in
                 guard let self, case .taken(var mugshot, _) = self.state else { return }
                 mugshot.face = face
+                if face != nil, let raw = mugshot.rawImage {
+                    mugshot.match = Lineup.shared.identify(cgImage: raw)
+                }
                 self.state = .taken(mugshot, analyzed: true)
                 for view in self.views {
                     view.show(mugshot)

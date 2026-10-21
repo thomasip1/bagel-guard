@@ -3,16 +3,25 @@
 // Without a photo it uses a synthetic sensor frame with a face box, to check the target lock.
 
 import Cocoa
+import CoreML
 
 enum DevTools {
     static func runIfRequested() {
         let args = CommandLine.arguments
+        if let idx = args.firstIndex(of: "--lineup-test"), args.count > idx + 1 {
+            lineupTest(photo: args[idx + 1])
+        }
         guard let flag = args.firstIndex(of: "--render"), args.count > flag + 1 else { return }
         let mugshot: Mugshot
         if args.count > flag + 2, let photo = NSImage(contentsOfFile: args[flag + 2]),
             let cgImage = photo.cgImage(forProposedRect: nil, context: nil, hints: nil)
         {
-            mugshot = Mugshot(image: NSImage(cgImage: cgImage, size: .zero), face: MugshotCamera.face(in: cgImage))
+            let lineup = Lineup.shared
+            lineup.loadInBackground()
+            let sem = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async { while !lineup.isReady { Thread.sleep(forTimeInterval: 0.1) }; sem.signal() }
+            sem.wait()
+            mugshot = Mugshot(image: NSImage(cgImage: cgImage, size: .zero), face: MugshotCamera.face(in: cgImage), match: lineup.identify(cgImage: cgImage))
         } else {
             let frame = NSImage(size: NSSize(width: 1280, height: 720), flipped: true) { rect in
                 NSGradient(starting: NSColor(white: 0.32, alpha: 1), ending: NSColor(white: 0.12, alpha: 1))?.draw(in: rect, angle: 90)
@@ -31,5 +40,28 @@ enum DevTools {
             FileHandle.standardError.write(Data("render failed: \(error)\n".utf8))
             exit(1)
         }
+    }
+
+    private static func lineupTest(photo path: String) {
+        let lineup = Lineup.shared
+        lineup.loadInBackground()
+        // Wait for indexing
+        let sem = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            while !lineup.isReady { Thread.sleep(forTimeInterval: 0.1) }
+            sem.signal()
+        }
+        sem.wait()
+
+        guard let image = NSImage(contentsOfFile: path),
+              let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        else { print("could not load \(path)"); exit(1) }
+
+        if let match = lineup.identify(cgImage: cgImage) {
+            print("MATCH: \(match.name) (\(String(format: "%.4f", match.similarity)))")
+        } else {
+            print("NO MATCH (below threshold \(0.363))")
+        }
+        exit(0)
     }
 }

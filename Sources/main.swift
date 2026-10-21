@@ -525,6 +525,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             MugshotCamera.requestAccessIfNeeded()
             DispatchQueue.global(qos: .utility).async { MugshotCamera.warmUp() }
         }
+        Lineup.shared.loadInBackground()
         if CommandLine.arguments.contains("--preview") { testOverlay() }
     }
 
