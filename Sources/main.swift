@@ -8,6 +8,7 @@
 import ApplicationServices
 import Carbon.HIToolbox
 import Cocoa
+import LocalAuthentication
 import ServiceManagement
 
 let slackBundleID = "com.tinyspeck.slackmacgap"
@@ -83,6 +84,31 @@ enum Log {
         queue.async {
             FileHandle.standardError.write(line)
             file?.write(line)
+        }
+    }
+}
+
+// MARK: - Owner check
+
+/// Asks for Touch ID before any settings change, so whoever is at the unlocked Mac can't disarm
+/// BagelGuard first. Falls back to the login password only when Touch ID isn't available (lid shut,
+/// no Touch ID keyboard), so the owner is never locked out of their own settings.
+enum OwnerCheck {
+    static func require(_ reason: String, then action: @escaping () -> Void) {
+        let context = LAContext()
+        context.localizedFallbackTitle = ""
+        let policy: LAPolicy = context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: nil)
+            ? .deviceOwnerAuthenticationWithBiometrics
+            : .deviceOwnerAuthentication
+        NSApp.activate(ignoringOtherApps: true)
+        context.evaluatePolicy(policy, localizedReason: reason) { ok, error in
+            DispatchQueue.main.async {
+                if ok {
+                    action()
+                } else {
+                    Log.write("owner check refused (\(reason)): \(error?.localizedDescription ?? "unknown")")
+                }
+            }
         }
     }
 }
@@ -643,19 +669,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(checkbox: "Start at login", SMAppService.mainApp.status == .enabled, #selector(toggleLoginItem))
         menu.addItem(NSMenuItem(title: "Open log", action: #selector(openLog), keyEquivalent: ""))
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit BagelGuard", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit BagelGuard", action: #selector(quit), keyEquivalent: "q"))
     }
 
     @objc func toggleArmed() {
-        Settings.armed.toggle()
-        Log.write("armed=\(Settings.armed)")
-        refreshIcon()
+        OwnerCheck.require(Settings.armed ? "disarm BagelGuard" : "arm BagelGuard") { [weak self] in
+            Settings.armed.toggle()
+            Log.write("armed=\(Settings.armed)")
+            self?.refreshIcon()
+        }
     }
 
     @objc func chooseAction(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String, let action = Action(rawValue: raw) else { return }
-        Settings.action = action
-        Log.write("action=\(action.rawValue)")
+        guard let raw = sender.representedObject as? String, let action = Action(rawValue: raw),
+              action != Settings.action
+        else { return }
+        OwnerCheck.require("change what BagelGuard does on a catch") {
+            Settings.action = action
+            Log.write("action=\(action.rawValue)")
+        }
     }
 
     @objc func testOverlay() {
@@ -663,8 +695,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleMugshot() {
-        Settings.mugshot.toggle()
-        if Settings.mugshot { MugshotCamera.requestAccessIfNeeded() }
+        OwnerCheck.require(Settings.mugshot ? "turn off BagelGuard's mugshot" : "turn on BagelGuard's mugshot") {
+            Settings.mugshot.toggle()
+            if Settings.mugshot { MugshotCamera.requestAccessIfNeeded() }
+        }
     }
 
     @objc func openMugshots() {
@@ -681,15 +715,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleLoginItem() {
-        do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
-            } else {
-                try SMAppService.mainApp.register()
+        let enabled = SMAppService.mainApp.status == .enabled
+        OwnerCheck.require(enabled ? "stop BagelGuard starting at login" : "start BagelGuard at login") {
+            do {
+                if enabled {
+                    try SMAppService.mainApp.unregister()
+                } else {
+                    try SMAppService.mainApp.register()
+                }
+            } catch {
+                Log.write("login item change failed: \(error)")
             }
-        } catch {
-            Log.write("login item change failed: \(error)")
         }
+    }
+
+    /// Quitting is the easiest way to disarm, so it needs the owner too.
+    @objc func quit() {
+        OwnerCheck.require("quit BagelGuard") { NSApp.terminate(nil) }
     }
 }
 
