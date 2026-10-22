@@ -19,7 +19,8 @@ so even if detection is a frame behind, the message never goes out.
 
 Reactions are not caught. The menu (🥯 in the menu bar) lets you disarm it, choose what happens on
 a catch (overlay then lock, overlay only, lock right away, or only log it), turn the photo off,
-preview the overlay, and start it at login.
+preview the overlay, and start it at login. "Only log it" is a pause: after 3 minutes it switches
+back to overlay then lock. Every change in the menu, including Quit, needs Touch ID.
 
 ## Face lineup
 

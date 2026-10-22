@@ -56,6 +56,15 @@ enum Settings {
         set { defaults.set(newValue.rawValue, forKey: "action") }
     }
 
+    /// "Only log it" is a temporary pause: it switches back to overlay + lock after this long.
+    static let logOnlyDuration: TimeInterval = 3 * 60
+
+    /// When "Only log it" ends. Persisted so a relaunch doesn't extend the pause.
+    static var logOnlyUntil: Date? {
+        get { defaults.object(forKey: "logOnlyUntil") as? Date }
+        set { defaults.set(newValue, forKey: "logOnlyUntil") }
+    }
+
     /// Counts caught attempts; shown as the case number on the overlay.
     static func nextCaseNumber() -> Int {
         let next = defaults.integer(forKey: "caseCount") + 1
@@ -532,8 +541,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     /// Set from detection until the overlay is up, so a second report in between is ignored.
     var responding = false
+    var reengageTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        scheduleReengage()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         // Keeps the spot the user ⌘-drags it to, so it can be moved clear of the notch once.
         statusItem.autosaveName = "BagelGuard"
@@ -655,7 +666,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let actions = NSMenuItem(title: "When a bagel shows up", action: nil, keyEquivalent: "")
         actions.submenu = NSMenu()
         for action in Action.allCases {
-            let item = NSMenuItem(title: action.title, action: #selector(chooseAction(_:)), keyEquivalent: "")
+            var title = action.title
+            if action == .log, Settings.action == .log, let until = Settings.logOnlyUntil {
+                let minutes = max(1, Int(ceil(until.timeIntervalSinceNow / 60)))
+                title += " (overlay + lock again in \(minutes) min)"
+            } else if action == .log {
+                title += " for \(Int(Settings.logOnlyDuration / 60)) min"
+            }
+            let item = NSMenuItem(title: title, action: #selector(chooseAction(_:)), keyEquivalent: "")
             item.representedObject = action.rawValue
             item.state = Settings.action == action ? .on : .off
             actions.submenu?.addItem(item)
@@ -684,10 +702,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let raw = sender.representedObject as? String, let action = Action(rawValue: raw),
               action != Settings.action
         else { return }
-        OwnerCheck.require("change what BagelGuard does on a catch") {
+        OwnerCheck.require("change what BagelGuard does on a catch") { [weak self] in
             Settings.action = action
+            Settings.logOnlyUntil = action == .log ? Date().addingTimeInterval(Settings.logOnlyDuration) : nil
             Log.write("action=\(action.rawValue)")
+            self?.scheduleReengage()
         }
+    }
+
+    /// While "Only log it" is on, switches back to overlay + lock when its time is up.
+    func scheduleReengage() {
+        reengageTimer?.invalidate()
+        reengageTimer = nil
+        guard Settings.action == .log else {
+            Settings.logOnlyUntil = nil
+            return
+        }
+        // Set before this feature existed, or the deadline was lost: start the clock now.
+        let deadline = Settings.logOnlyUntil ?? Date().addingTimeInterval(Settings.logOnlyDuration)
+        Settings.logOnlyUntil = deadline
+        let timer = Timer(fire: deadline, interval: 0, repeats: false) { [weak self] _ in
+            Settings.action = .overlayThenLock
+            Settings.logOnlyUntil = nil
+            Log.write("action=\(Action.overlayThenLock.rawValue) (log-only expired)")
+            self?.reengageTimer = nil
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        reengageTimer = timer
     }
 
     @objc func testOverlay() {
