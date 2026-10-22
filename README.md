@@ -23,6 +23,32 @@ preview the overlay, and start it at login. Every change in the menu, including 
 ID, and anything that weakens the guard is only a pause: disarming, a milder catch action, turning
 the photo off, turning off start at login, or quitting all undo themselves after 3 minutes.
 
+## Jev check
+
+The rules above only catch bagels that say they are bagels. A bagel emoji uploaded under another
+name gets past them, so BagelGuard also asks [Jev](https://docs.typesafe.ai) (`jev-1.14.0`, TypeSafe's
+System One model) about every message. It sends a screenshot of the message box as rendered, each
+emoji in it cut out and enlarged next to a reference 🥯, plus the text and emoji names. Jev answers
+two yes/no questions:
+
+- **bagel**: is there a bagel in any form, whatever the emoji is called? Caught at 30% or more.
+- **impostor**: does this look like someone else typing on your unlocked laptop, rather than a
+  message a software engineer would send? Caught at 50% or more.
+
+The check runs while you type (about 300 ms), so Return usually gets its answer straight away. If it
+isn't ready, Return or the Send click waits for it and goes through once Jev clears the message.
+If Jev can't be reached within 3 seconds, the message is sent anyway.
+
+Needs `JEV_API_KEY`, either in the environment or set in your fish config (`set -gx JEV_API_KEY …`),
+and **Screen Recording** permission for the screenshot. Without the permission, Jev judges the text
+and emoji names alone. Every message you type in Slack is sent to TypeSafe's API.
+
+Try a message without Slack:
+
+```bash
+~/Applications/BagelGuard.app/Contents/MacOS/BagelGuard --jev-test "I'm buying bagels for everyone"
+```
+
 ## Face lineup
 
 Drop photos into `~/Pictures/BagelGuard/Lineup/` named `Firstname Lastname.jpg`. At launch,
@@ -45,7 +71,8 @@ open ~/Applications/BagelGuard.app
 `build.sh` compiles the app and installs it to `~/Applications/BagelGuard.app`.
 
 On first launch, grant BagelGuard **Accessibility** access when macOS asks (System Settings →
-Privacy & Security → Accessibility), and allow **Camera** access for the photo.
+Privacy & Security → Accessibility), allow **Camera** access for the photo, and allow **Screen
+Recording** for the Jev check.
 
 The build is signed ad hoc, so macOS asks for Accessibility again after every rebuild. To keep the
 grant across rebuilds, create a self-signed code-signing certificate named `BagelGuard Local

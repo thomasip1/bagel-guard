@@ -185,6 +185,19 @@ func axAncestors(_ element: AXUIElement, limit: Int) -> some Sequence<AXUIElemen
     sequence(first: element) { axElement($0, kAXParentAttribute) }.prefix(limit)
 }
 
+/// Where the element is on screen, in global top-left-origin points.
+func axFrame(_ element: AXUIElement) -> CGRect? {
+    var position: CFTypeRef?, size: CFTypeRef?
+    var origin = CGPoint.zero, extent = CGSize.zero
+    guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &position) == .success,
+        AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &size) == .success,
+        let position, let size,
+        CFGetTypeID(position) == AXValueGetTypeID(), CFGetTypeID(size) == AXValueGetTypeID(),
+        AXValueGetValue(position as! AXValue, .cgPoint, &origin), AXValueGetValue(size as! AXValue, .cgSize, &extent)
+    else { return nil }
+    return CGRect(origin: origin, size: extent)
+}
+
 /// What the element says about itself: its description, or else its title.
 func axLabel(_ element: AXUIElement) -> String {
     let description: String = axAttr(element, kAXDescriptionAttribute) ?? ""
@@ -203,6 +216,8 @@ enum Evidence: Equatable, CustomStringConvertible {
     case word(String)
     /// A converted emoji: Slack's image label, e.g. "bagel pet emoji".
     case emoji(String)
+    /// Jev's judgment of the box as rendered and its text, e.g. "looks like a bagel (Jev 93%)".
+    case jev(String)
 
     var description: String {
         switch self {
@@ -210,6 +225,7 @@ enum Evidence: Equatable, CustomStringConvertible {
         case .shortcode(let text): return "shortcode \(text)"
         case .word(let text): return "text \"\(text)\""
         case .emoji(let label): return "emoji image \"\(label)\""
+        case .jev(let reason): return "jev: \(reason)"
         }
     }
 
@@ -220,6 +236,7 @@ enum Evidence: Equatable, CustomStringConvertible {
         case .shortcode(let text): return "\(text) shortcode"
         case .word(let text): return "the word \"\(text)\""
         case .emoji(let label): return label
+        case .jev(let reason): return reason
         }
     }
 }
@@ -271,17 +288,26 @@ enum Detector {
     /// Slack turns a finished emoji into an AXImage inside the message box, labelled e.g. "bagel
     /// emoji" or "bagel pet emoji".
     static func scanImages(in root: AXUIElement) -> Evidence? {
+        imageLabels(in: root).first { $0.lowercased().contains("bagel") }.map(Evidence.emoji)
+    }
+
+    static func imageLabels(in root: AXUIElement) -> [String] {
+        var labels: [String] = []
         var stack: [(AXUIElement, Int)] = [(root, 0)]
         var visited = 0
         while let (element, depth) = stack.popLast(), visited < 400 {
             visited += 1
             if (axAttr(element, kAXRoleAttribute) as String?) == kAXImageRole {
-                let label = axLabel(element)
-                if label.lowercased().contains("bagel") { return .emoji(label) }
+                labels.append(axLabel(element))
             }
             if depth < 8 { stack.append(contentsOf: axChildren(element).map { ($0, depth + 1) }) }
         }
-        return nil
+        return labels
+    }
+
+    /// The message box (a text area) the focused node sits in, if any.
+    static func messageBox(focused: AXUIElement) -> AXUIElement? {
+        axAncestors(focused, limit: 6).first { (axAttr($0, kAXRoleAttribute) as String?) == kAXTextAreaRole }
     }
 
     private static func first(_ regex: NSRegularExpression, in text: String) -> String? {
@@ -309,6 +335,10 @@ final class SlackWatcher {
     private(set) var lastSightingDate: Date?
     var onHit: ((Hit, String) -> Void)?
     var onApproach: (() -> Void)?
+    /// The message box content once typing pauses, for Jev to screen.
+    var onContentSettled: ((MessageSnapshot) -> Void)?
+    private var lastContentKey: String?
+    private var settleTimer: Timer?
 
     func start() {
         let center = NSWorkspace.shared.notificationCenter
@@ -402,6 +432,16 @@ final class SlackWatcher {
         return Detector.observe(focused: focused)
     }
 
+    /// What Slack's focused message box holds, if a message box has focus.
+    func messageSnapshot() -> MessageSnapshot? {
+        guard let app, let focused = axElement(app, kAXFocusedUIElementAttribute),
+            let box = Detector.messageBox(focused: focused)
+        else { return nil }
+        return MessageSnapshot(
+            text: axAttr(box, kAXValueAttribute) ?? "", emojiLabels: Detector.imageLabels(in: box),
+            field: axLabel(box), frame: axFrame(box))
+    }
+
     /// The bagel currently in Slack's focused field, if any.
     func currentHit() -> Hit? {
         if case .bagel(let hit) = observeFocused() { return hit }
@@ -423,10 +463,27 @@ final class SlackWatcher {
             guard hit != reported else { return }
             reported = hit
             onHit?(hit, source)
-        } else if reported != nil,
-            let last = lastSightingDate, Date().timeIntervalSince(last) > 2
-        {
-            reported = nil
+        } else {
+            if reported != nil, let last = lastSightingDate, Date().timeIntervalSince(last) > 2 {
+                reported = nil
+            }
+            noteContent()
+        }
+    }
+
+    /// Hands the message box to Jev once its content has been still for a moment.
+    private func noteContent() {
+        guard onContentSettled != nil, let snapshot = messageSnapshot(), !snapshot.isEmpty else {
+            lastContentKey = nil
+            settleTimer?.invalidate()
+            return
+        }
+        guard snapshot.key != lastContentKey else { return }
+        lastContentKey = snapshot.key
+        settleTimer?.invalidate()
+        settleTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
+            guard let self, let now = self.messageSnapshot(), now.key == snapshot.key else { return }
+            self.onContentSettled?(now)
         }
     }
 
@@ -444,9 +501,17 @@ final class SlackWatcher {
 final class SendInterceptor {
     private var tap: CFMachPort?
     let watcher: SlackWatcher
+    let jev: JevGuard
     var onBlocked: ((Hit, String) -> Void)?
+    /// A send held while Jev looks at the message.
+    private var holding = false
+    /// Marks the Return or click replayed after Jev clears a held send, so the tap lets it through.
+    private static let replayMarker: Int64 = 0x6261_6765_6C
 
-    init(watcher: SlackWatcher) { self.watcher = watcher }
+    init(watcher: SlackWatcher, jev: JevGuard) {
+        self.watcher = watcher
+        self.jev = jev
+    }
 
     func start() {
         let mask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.leftMouseDown.rawValue)
@@ -472,6 +537,7 @@ final class SendInterceptor {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return pass
         }
+        guard event.getIntegerValueField(.eventSourceUserData) != Self.replayMarker else { return pass }
         guard Settings.armed, Settings.action != .log, let slackPid = watcher.pid else { return pass }
 
         if type == .keyDown {
@@ -489,6 +555,10 @@ final class SendInterceptor {
                 onBlocked?(stale, "return key (recent sighting)")
                 return nil
             }
+            // Shift-Return is a new line, not a send.
+            if !event.flags.contains(.maskShift), jevHolds(source: "return key", replay: Self.replayReturn) {
+                return nil
+            }
             return pass
         }
 
@@ -504,8 +574,57 @@ final class SendInterceptor {
                 onBlocked?(stale, "send button (recent sighting)")
                 return nil
             }
+            let location = event.location
+            if jevHolds(source: "send button", replay: { Self.replayClick(at: location) }) {
+                return nil
+            }
         }
         return pass
+    }
+
+    /// Whether to hold this send for Jev. A verdict from while typing answers at once; otherwise
+    /// the send waits for Jev and is replayed if the message is fine. Jev being unreachable for 3
+    /// seconds lets the send go, so a network outage doesn't stop Slack working.
+    private func jevHolds(source: String, replay: @escaping () -> Void) -> Bool {
+        guard jev.isAvailable, let snapshot = watcher.messageSnapshot(), !snapshot.isEmpty else { return false }
+        if holding { return true }
+        if let verdict = jev.cached(snapshot.key) {
+            guard verdict.intercepts else { return false }
+            onBlocked?(Hit(evidence: .jev(verdict.reason), field: snapshot.field), "\(source) (jev)")
+            return true
+        }
+        holding = true
+        var settled = false
+        let finish: (JevVerdict?) -> Void = { [weak self] verdict in
+            guard let self, !settled else { return }
+            settled = true
+            self.holding = false
+            if let verdict, verdict.intercepts {
+                self.onBlocked?(Hit(evidence: .jev(verdict.reason), field: snapshot.field), "\(source) (jev, held)")
+            } else if self.watcher.slackIsFrontmost, self.watcher.messageSnapshot()?.key == snapshot.key {
+                if verdict == nil { Log.write("jev: no verdict in time; letting the send through") }
+                replay()
+            }
+        }
+        jev.screen(snapshot, completion: finish)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(nil) }
+        return true
+    }
+
+    private static func replayReturn() {
+        for down in [true, false] {
+            let event = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_Return), keyDown: down)
+            event?.setIntegerValueField(.eventSourceUserData, value: replayMarker)
+            event?.post(tap: .cghidEventTap)
+        }
+    }
+
+    private static func replayClick(at point: CGPoint) {
+        for type in [CGEventType.leftMouseDown, .leftMouseUp] {
+            let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: .left)
+            event?.setIntegerValueField(.eventSourceUserData, value: replayMarker)
+            event?.post(tap: .cghidEventTap)
+        }
     }
 
     /// The pid owning the window under the pointer, from the window server: cheap, and it keeps
@@ -565,7 +684,8 @@ enum Responder {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let watcher = SlackWatcher()
-    lazy var interceptor = SendInterceptor(watcher: watcher)
+    let jev = JevGuard()
+    lazy var interceptor = SendInterceptor(watcher: watcher, jev: jev)
     let overlay = OverlayController()
     var statusItem: NSStatusItem!
     /// Set from detection until the overlay is up, so a second report in between is ignored.
@@ -599,6 +719,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async { self?.trigger(hit, source: source, blockedSend: true) }
         }
         overlay.onClose = { [weak self] in self?.watcher.forgetReported() }
+        watcher.onContentSettled = { [weak self] snapshot in self?.screenWithJev(snapshot) }
+        jev.start()
 
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         if AXIsProcessTrustedWithOptions(options) {
@@ -648,6 +770,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// Jev's check while typing: catches what the local rules can't name, such as a bagel emoji
+    /// uploaded under another name, before anyone presses Return.
+    func screenWithJev(_ snapshot: MessageSnapshot) {
+        guard Settings.armed else { return }
+        jev.screen(snapshot) { [weak self] verdict in
+            guard let self, let verdict, verdict.intercepts,
+                self.watcher.messageSnapshot()?.key == snapshot.key
+            else { return }
+            self.trigger(Hit(evidence: .jev(verdict.reason), field: snapshot.field), source: "jev")
+        }
+    }
+
     /// The clear goes through the HID queue to the frontmost app, so wait for Slack to apply it
     /// before the overlay takes focus (a Return typed meanwhile queues behind it). Calls `then` with
     /// the time to a confirmed empty box, or nil if it isn't confirmed within 0.3 s.
@@ -655,7 +789,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard clearing else { return then(nil) }
         Timer.scheduledTimer(withTimeInterval: 0.01, repeats: true) { [weak self] timer in
             let elapsed = Date().timeIntervalSince(start)
-            let cleared = self?.watcher.currentHit() == nil
+            // A Jev catch has no local evidence to watch disappear, so wait for the box to empty.
+            let cleared = self?.watcher.currentHit() == nil && self?.watcher.messageSnapshot()?.isEmpty ?? true
             guard cleared || elapsed > 0.3 else { return }
             timer.invalidate()
             then(cleared ? Int(elapsed * 1000) : nil)

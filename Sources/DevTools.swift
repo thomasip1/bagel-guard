@@ -11,6 +11,9 @@ enum DevTools {
         if let idx = args.firstIndex(of: "--lineup-test"), args.count > idx + 1 {
             lineupTest(photo: args[idx + 1])
         }
+        if let idx = args.firstIndex(of: "--jev-test"), args.count > idx + 1 {
+            jevTest(text: args[idx + 1], image: args.count > idx + 2 ? args[idx + 2] : nil)
+        }
         guard let flag = args.firstIndex(of: "--render"), args.count > flag + 1 else { return }
         let mugshot: Mugshot
         if args.count > flag + 2, let photo = NSImage(contentsOfFile: args[flag + 2]),
@@ -62,6 +65,30 @@ enum DevTools {
         } else {
             print("NO MATCH (below threshold \(0.363))")
         }
+        exit(0)
+    }
+
+    /// `--jev-test "message text" [box.png]`: asks Jev about a message, optionally with a picture
+    /// standing in for the rendered message box, and prints both probabilities.
+    private static func jevTest(text: String, image path: String?) {
+        guard let key = Jev.loadAPIKey() else { print("no JEV_API_KEY"); exit(1) }
+        let boxImage = path.flatMap { NSImage(contentsOfFile: $0)?.cgImage(forProposedRect: nil, context: nil, hints: nil) }
+        // The test boxes have their emoji at x 200-252 of 1400 (see the box generator).
+        let emoji = boxImage.flatMap { $0.cropping(to: CGRect(x: 196, y: 18, width: 60, height: 60)) }
+        let snapshot = MessageSnapshot(text: text, emojiLabels: emoji == nil ? [] : ["morning-sun emoji"], field: "Message to eng-team", frame: nil)
+        let sem = DispatchSemaphore(value: 0)
+        Task {
+            let started = Date()
+            do {
+                let verdict = try await Jev.judge(snapshot, boxImage: boxImage, emojiImages: emoji.map { [$0] } ?? [], apiKey: key)
+                print(String(format: "bagel=%.2f impostor=%.2f intercept=%@ %dms", verdict.bagel, verdict.impostor,
+                             verdict.intercepts ? "YES" : "no", Int(Date().timeIntervalSince(started) * 1000)))
+            } catch {
+                print("failed: \(error.localizedDescription)")
+            }
+            sem.signal()
+        }
+        sem.wait()
         exit(0)
     }
 }
