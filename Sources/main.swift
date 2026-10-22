@@ -359,7 +359,9 @@ final class SlackWatcher {
             guard hit != reported else { return }
             reported = hit
             onHit?(hit, source)
-        } else {
+        } else if reported != nil,
+            let last = lastSightingDate, Date().timeIntervalSince(last) > 2
+        {
             reported = nil
         }
     }

@@ -666,7 +666,7 @@ final class OverlayController {
         let ending = booking?.ending
         closeWindows()
         discardCamera()
-        onClose?()
+        if ending != .lock { onClose?() }
         if ending == .lock { Responder.lockScreen() }
     }
 
