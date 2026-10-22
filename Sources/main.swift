@@ -56,20 +56,49 @@ enum Settings {
         set { defaults.set(newValue.rawValue, forKey: "action") }
     }
 
-    /// "Only log it" is a temporary pause: it switches back to overlay + lock after this long.
-    static let logOnlyDuration: TimeInterval = 3 * 60
-
-    /// When "Only log it" ends. Persisted so a relaunch doesn't extend the pause.
-    static var logOnlyUntil: Date? {
-        get { defaults.object(forKey: "logOnlyUntil") as? Date }
-        set { defaults.set(newValue, forKey: "logOnlyUntil") }
-    }
-
     /// Counts caught attempts; shown as the case number on the overlay.
     static func nextCaseNumber() -> Int {
         let next = defaults.integer(forKey: "caseCount") + 1
         defaults.set(next, forKey: "caseCount")
         return next
+    }
+
+    /// Turning any safeguard off is a pause: it turns itself back on after this long.
+    static let reengageAfter: TimeInterval = 3 * 60
+
+    /// When a turned-off safeguard comes back on. Persisted so a relaunch doesn't extend the pause.
+    static func reengageAt(_ safeguard: Safeguard) -> Date? {
+        defaults.object(forKey: "reengageAt.\(safeguard.rawValue)") as? Date
+    }
+
+    static func setReengageAt(_ safeguard: Safeguard, _ date: Date?) {
+        defaults.set(date, forKey: "reengageAt.\(safeguard.rawValue)")
+    }
+}
+
+/// A setting in the menu that weakens BagelGuard when turned off.
+enum Safeguard: String, CaseIterable {
+    case armed, action, mugshot, loginItem
+
+    var isEngaged: Bool {
+        switch self {
+        case .armed: return Settings.armed
+        case .action: return Settings.action == .overlayThenLock
+        case .mugshot: return Settings.mugshot
+        case .loginItem: return SMAppService.mainApp.status == .enabled
+        }
+    }
+
+    func engage() {
+        switch self {
+        case .armed: Settings.armed = true
+        case .action: Settings.action = .overlayThenLock
+        case .mugshot:
+            Settings.mugshot = true
+            MugshotCamera.requestAccessIfNeeded()
+        case .loginItem:
+            do { try SMAppService.mainApp.register() } catch { Log.write("login item change failed: \(error)") }
+        }
     }
 }
 
@@ -541,10 +570,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     /// Set from detection until the overlay is up, so a second report in between is ignored.
     var responding = false
-    var reengageTimer: Timer?
+    var reengageTimers: [Safeguard: Timer] = [:]
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        scheduleReengage()
+        for safeguard in Safeguard.allCases {
+            // Turned off before re-engaging existed: start the clock now. Start at login is
+            // opt-in, so it only comes back if it was turned off from the menu.
+            if !safeguard.isEngaged, safeguard != .loginItem, Settings.reengageAt(safeguard) == nil {
+                Settings.setReengageAt(safeguard, Date().addingTimeInterval(Settings.reengageAfter))
+            }
+            scheduleReengage(safeguard)
+        }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         // Keeps the spot the user ⌘-drags it to, so it can be moved clear of the notch once.
         statusItem.autosaveName = "BagelGuard"
@@ -656,45 +692,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(disabled: "Needs the Accessibility permission")
             menu.addItem(NSMenuItem(title: "Open Accessibility settings…", action: #selector(openAXSettings), keyEquivalent: ""))
         } else if !Settings.armed {
-            menu.addItem(disabled: "Not watching Slack")
+            menu.addItem(disabled: "Not watching Slack" + countdown(.armed))
         } else {
             menu.addItem(disabled: watcher.pid == nil ? "Waiting for Slack to open" : "Watching Slack for bagels")
         }
         menu.addItem(.separator())
 
-        menu.addItem(checkbox: "Armed", Settings.armed, #selector(toggleArmed))
+        menu.addItem(checkbox: "Armed" + countdown(.armed), Settings.armed, #selector(toggleArmed))
         let actions = NSMenuItem(title: "When a bagel shows up", action: nil, keyEquivalent: "")
         actions.submenu = NSMenu()
         for action in Action.allCases {
-            var title = action.title
-            if action == .log, Settings.action == .log, let until = Settings.logOnlyUntil {
-                let minutes = max(1, Int(ceil(until.timeIntervalSinceNow / 60)))
-                title += " (overlay + lock again in \(minutes) min)"
-            } else if action == .log {
-                title += " for \(Int(Settings.logOnlyDuration / 60)) min"
-            }
+            let title = action.title + (Settings.action == action ? countdown(.action) : "")
             let item = NSMenuItem(title: title, action: #selector(chooseAction(_:)), keyEquivalent: "")
             item.representedObject = action.rawValue
             item.state = Settings.action == action ? .on : .off
             actions.submenu?.addItem(item)
         }
         menu.addItem(actions)
-        menu.addItem(checkbox: "Take a mugshot", Settings.mugshot, #selector(toggleMugshot))
+        menu.addItem(checkbox: "Take a mugshot" + countdown(.mugshot), Settings.mugshot, #selector(toggleMugshot))
         menu.addItem(NSMenuItem(title: "Preview overlay", action: #selector(testOverlay), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Open mugshots", action: #selector(openMugshots), keyEquivalent: ""))
         menu.addItem(.separator())
 
-        menu.addItem(checkbox: "Start at login", SMAppService.mainApp.status == .enabled, #selector(toggleLoginItem))
+        menu.addItem(checkbox: "Start at login" + countdown(.loginItem), Safeguard.loginItem.isEngaged, #selector(toggleLoginItem))
         menu.addItem(NSMenuItem(title: "Open log", action: #selector(openLog), keyEquivalent: ""))
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit BagelGuard", action: #selector(quit), keyEquivalent: "q"))
+        let minutes = Int(Settings.reengageAfter / 60)
+        menu.addItem(NSMenuItem(title: "Quit BagelGuard (reopens in \(minutes) min)", action: #selector(quit), keyEquivalent: "q"))
+    }
+
+    /// " (back on in N min)" for a safeguard that is turned off, else "".
+    func countdown(_ safeguard: Safeguard) -> String {
+        guard let until = Settings.reengageAt(safeguard) else { return "" }
+        let minutes = max(1, Int(ceil(until.timeIntervalSinceNow / 60)))
+        return safeguard == .action ? " (overlay + lock again in \(minutes) min)" : " (back on in \(minutes) min)"
+    }
+
+    /// Applies a menu change and, if it turned a safeguard off, starts its re-engage clock. Switching
+    /// between two "off" states (say, overlay only to log only) keeps the clock already running.
+    func apply(_ safeguard: Safeguard, _ change: () -> Void) {
+        change()
+        if safeguard.isEngaged {
+            Settings.setReengageAt(safeguard, nil)
+        } else if Settings.reengageAt(safeguard) == nil {
+            Settings.setReengageAt(safeguard, Date().addingTimeInterval(Settings.reengageAfter))
+        }
+        scheduleReengage(safeguard)
+        refreshIcon()
+    }
+
+    /// Turns a safeguard back on when its pause runs out.
+    func scheduleReengage(_ safeguard: Safeguard) {
+        reengageTimers.removeValue(forKey: safeguard)?.invalidate()
+        guard !safeguard.isEngaged, let deadline = Settings.reengageAt(safeguard) else {
+            Settings.setReengageAt(safeguard, nil)
+            return
+        }
+        let timer = Timer(fire: deadline, interval: 0, repeats: false) { [weak self] _ in
+            self?.reengageTimers[safeguard] = nil
+            Settings.setReengageAt(safeguard, nil)
+            safeguard.engage()
+            Log.write("\(safeguard.rawValue) re-engaged")
+            self?.refreshIcon()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        reengageTimers[safeguard] = timer
     }
 
     @objc func toggleArmed() {
         OwnerCheck.require(Settings.armed ? "disarm BagelGuard" : "arm BagelGuard") { [weak self] in
-            Settings.armed.toggle()
+            self?.apply(.armed) { Settings.armed.toggle() }
             Log.write("armed=\(Settings.armed)")
-            self?.refreshIcon()
         }
     }
 
@@ -703,32 +771,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               action != Settings.action
         else { return }
         OwnerCheck.require("change what BagelGuard does on a catch") { [weak self] in
-            Settings.action = action
-            Settings.logOnlyUntil = action == .log ? Date().addingTimeInterval(Settings.logOnlyDuration) : nil
+            self?.apply(.action) { Settings.action = action }
             Log.write("action=\(action.rawValue)")
-            self?.scheduleReengage()
         }
-    }
-
-    /// While "Only log it" is on, switches back to overlay + lock when its time is up.
-    func scheduleReengage() {
-        reengageTimer?.invalidate()
-        reengageTimer = nil
-        guard Settings.action == .log else {
-            Settings.logOnlyUntil = nil
-            return
-        }
-        // Set before this feature existed, or the deadline was lost: start the clock now.
-        let deadline = Settings.logOnlyUntil ?? Date().addingTimeInterval(Settings.logOnlyDuration)
-        Settings.logOnlyUntil = deadline
-        let timer = Timer(fire: deadline, interval: 0, repeats: false) { [weak self] _ in
-            Settings.action = .overlayThenLock
-            Settings.logOnlyUntil = nil
-            Log.write("action=\(Action.overlayThenLock.rawValue) (log-only expired)")
-            self?.reengageTimer = nil
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        reengageTimer = timer
     }
 
     @objc func testOverlay() {
@@ -736,8 +781,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleMugshot() {
-        OwnerCheck.require(Settings.mugshot ? "turn off BagelGuard's mugshot" : "turn on BagelGuard's mugshot") {
-            Settings.mugshot.toggle()
+        OwnerCheck.require(Settings.mugshot ? "turn off BagelGuard's mugshot" : "turn on BagelGuard's mugshot") { [weak self] in
+            self?.apply(.mugshot) { Settings.mugshot.toggle() }
             if Settings.mugshot { MugshotCamera.requestAccessIfNeeded() }
         }
     }
@@ -757,22 +802,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func toggleLoginItem() {
         let enabled = SMAppService.mainApp.status == .enabled
-        OwnerCheck.require(enabled ? "stop BagelGuard starting at login" : "start BagelGuard at login") {
-            do {
-                if enabled {
-                    try SMAppService.mainApp.unregister()
-                } else {
-                    try SMAppService.mainApp.register()
+        OwnerCheck.require(enabled ? "stop BagelGuard starting at login" : "start BagelGuard at login") { [weak self] in
+            self?.apply(.loginItem) {
+                do {
+                    if enabled {
+                        try SMAppService.mainApp.unregister()
+                    } else {
+                        try SMAppService.mainApp.register()
+                    }
+                } catch {
+                    Log.write("login item change failed: \(error)")
                 }
-            } catch {
-                Log.write("login item change failed: \(error)")
             }
         }
     }
 
-    /// Quitting is the easiest way to disarm, so it needs the owner too.
+    /// Quitting is the easiest way to disarm, so it needs the owner too, and a detached shell
+    /// reopens the app once the pause is over.
     @objc func quit() {
-        OwnerCheck.require("quit BagelGuard") { NSApp.terminate(nil) }
+        OwnerCheck.require("quit BagelGuard") {
+            let reopen = Process()
+            reopen.executableURL = URL(fileURLWithPath: "/bin/sh")
+            reopen.arguments = ["-c", "sleep \(Int(Settings.reengageAfter)); exec /usr/bin/open -g \"$0\"", Bundle.main.bundlePath]
+            do { try reopen.run() } catch { Log.write("couldn't schedule reopen: \(error)") }
+            Log.write("quit; reopening in \(Int(Settings.reengageAfter / 60)) min")
+            NSApp.terminate(nil)
+        }
     }
 }
 
