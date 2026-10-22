@@ -26,22 +26,27 @@ the photo off, turning off start at login, or quitting all undo themselves after
 ## Jev check
 
 The rules above only catch bagels that say they are bagels. A bagel emoji uploaded under another
-name gets past them, so BagelGuard also asks [Jev](https://docs.typesafe.ai) (`jev-1.14.0`, TypeSafe's
-System One model) about every message. It sends a screenshot of the message box as rendered, each
-emoji in it cut out and enlarged next to a reference 🥯, plus the text and emoji names. Jev answers
-two yes/no questions:
+name gets past them, so BagelGuard also uses [Jev](https://docs.typesafe.ai) (`jev-1.14.0`, TypeSafe's
+System One model) in two ways.
 
-- **bagel**: is there a bagel in any form, whatever the emoji is called? Caught at 30% or more.
-- **impostor**: does this look like someone else typing on your unlocked laptop, rather than a
-  message a software engineer would send? Caught at 50% or more.
+**Emoji book.** Every emoji BagelGuard sees in Slack, in the message box or anywhere on screen, is
+cut out of a screenshot and Jev judges once whether it's a bagel, next to a reference 🥯. The
+answer is remembered, and an emoji judged a bagel (50% or more) is from then on caught by name the
+moment it lands in the message box, like `:bagel:`. Its name typed as a word ("legab haha") counts
+too.
 
-The check runs while you type (about 300 ms), so Return usually gets its answer straight away. If it
-isn't ready, Return or the Send click waits for it and goes through once Jev clears the message.
-If Jev can't be reached within 3 seconds, the message is sent anyway.
+**Sent messages.** When the message box goes from holding something to empty, a message went out.
+BagelGuard checks it after the fact: its emoji against the emoji book, the local rules again, and
+Jev on the text, asking whether it looks like someone else typing on your unlocked laptop rather
+than a message a software engineer would send (50% or more). A flagged message is deleted through
+Slack's own UI (Up focuses your last message, Delete, confirm), then handled like any other catch.
+
+Both work from Slack's accessibility tree, not keystrokes, so they keep working when macOS leaves
+Secure Keyboard Entry stuck on after a screen unlock (which blinds the Return backstop).
 
 Needs `JEV_API_KEY`, either in the environment or set in your fish config (`set -gx JEV_API_KEY …`),
-and **Screen Recording** permission for the screenshot. Without the permission, Jev judges the text
-and emoji names alone. Every message you type in Slack is sent to TypeSafe's API.
+and **Screen Recording** permission to see emoji pictures. Sent messages' text and emoji names, and
+pictures of emoji, are sent to TypeSafe's API.
 
 Try a message without Slack:
 

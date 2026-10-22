@@ -256,7 +256,8 @@ enum Observation {
 
 enum Detector {
     static let shortcode = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bagel", options: [.caseInsensitive])
-    static let word = try! NSRegularExpression(pattern: "bagel", options: [.caseInsensitive])
+    /// The word, or spelled backwards.
+    static let word = try! NSRegularExpression(pattern: "bagel|legab", options: [.caseInsensitive])
     /// `:bag`, `:hotbag`, or a word starting "bage" (plain "bag" is too common, and "garbage" isn't one).
     static let partial = try! NSRegularExpression(pattern: ":[a-z0-9_+'-]*bag|\\bbage", options: [.caseInsensitive])
 
@@ -282,27 +283,34 @@ enum Detector {
         if text.contains("\u{1F96F}") { return .character }
         if let match = first(shortcode, in: text) { return .shortcode(match) }
         if plainText, let match = first(word, in: text) { return .word(match) }
+        if plainText, let match = first(EmojiBook.shared.namesPattern, in: text) { return .word(match) }
         return nil
     }
 
     /// Slack turns a finished emoji into an AXImage inside the message box, labelled e.g. "bagel
     /// emoji" or "bagel pet emoji".
+    /// Also counts emoji whose picture Jev judged to be a bagel, whatever they're called.
     static func scanImages(in root: AXUIElement) -> Evidence? {
-        imageLabels(in: root).first { $0.lowercased().contains("bagel") }.map(Evidence.emoji)
+        for image in images(in: root) {
+            if image.label.lowercased().contains("bagel") { return .emoji(image.label) }
+            if EmojiBook.shared.looksLikeBagel(image.label) { return .emoji("\(image.label), looks like a bagel") }
+        }
+        return nil
     }
 
-    static func imageLabels(in root: AXUIElement) -> [String] {
-        var labels: [String] = []
+    /// The emoji images in the box, in reading order, with where each is on screen.
+    static func images(in root: AXUIElement) -> [(label: String, frame: CGRect?)] {
+        var found: [(label: String, frame: CGRect?)] = []
         var stack: [(AXUIElement, Int)] = [(root, 0)]
         var visited = 0
         while let (element, depth) = stack.popLast(), visited < 400 {
             visited += 1
             if (axAttr(element, kAXRoleAttribute) as String?) == kAXImageRole {
-                labels.append(axLabel(element))
+                found.append((axLabel(element), axFrame(element)))
             }
-            if depth < 8 { stack.append(contentsOf: axChildren(element).map { ($0, depth + 1) }) }
+            if depth < 8 { stack.append(contentsOf: axChildren(element).reversed().map { ($0, depth + 1) }) }
         }
-        return labels
+        return found
     }
 
     /// The message box (a text area) the focused node sits in, if any.
@@ -310,8 +318,8 @@ enum Detector {
         axAncestors(focused, limit: 6).first { (axAttr($0, kAXRoleAttribute) as String?) == kAXTextAreaRole }
     }
 
-    private static func first(_ regex: NSRegularExpression, in text: String) -> String? {
-        guard let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+    private static func first(_ regex: NSRegularExpression?, in text: String) -> String? {
+        guard let regex, let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
             let range = Range(match.range, in: text)
         else { return nil }
         return String(text[range])
@@ -333,12 +341,14 @@ final class SlackWatcher {
     /// uses this to block Enter during the AX tree gap when Slack's autocomplete replaces a shortcode
     /// with an emoji image — currentHit() briefly returns nil even though a bagel just arrived.
     private(set) var lastSightingDate: Date?
+    /// A message went out: the box went from holding this to empty. Seen from Slack's own tree, so
+    /// it works when the event tap is blind (Secure Keyboard Entry stuck on after a screen lock).
+    var onSent: ((MessageSnapshot) -> Void)?
+    /// What the focused message box last held, while it held anything.
+    private var lastContent: MessageSnapshot?
+    private var emojiScanTimer: Timer?
     var onHit: ((Hit, String) -> Void)?
     var onApproach: (() -> Void)?
-    /// The message box content once typing pauses, for Jev to screen.
-    var onContentSettled: ((MessageSnapshot) -> Void)?
-    private var lastContentKey: String?
-    private var settleTimer: Timer?
 
     func start() {
         let center = NSWorkspace.shared.notificationCenter
@@ -437,9 +447,58 @@ final class SlackWatcher {
         guard let app, let focused = axElement(app, kAXFocusedUIElementAttribute),
             let box = Detector.messageBox(focused: focused)
         else { return nil }
+        let images = Detector.images(in: box)
         return MessageSnapshot(
-            text: axAttr(box, kAXValueAttribute) ?? "", emojiLabels: Detector.imageLabels(in: box),
-            field: axLabel(box), frame: axFrame(box))
+            text: axAttr(box, kAXValueAttribute) ?? "", emojiLabels: images.map(\.label),
+            emojiFrames: images.map { $0.frame ?? .zero }, field: axLabel(box), frame: axFrame(box))
+    }
+
+    /// The text the focused element (or an ancestor) holds, whatever kind of element it is: Slack's
+    /// inline message editor isn't a text area like the composer.
+    func focusedTextSnapshot() -> MessageSnapshot? {
+        guard let app, let focused = axElement(app, kAXFocusedUIElementAttribute) else { return nil }
+        let skipped: Set<String> = [kAXCheckBoxRole, kAXRadioButtonRole, kAXSliderRole, kAXButtonRole, kAXScrollBarRole]
+        for node in axAncestors(focused, limit: 8) {
+            guard let role: String = axAttr(node, kAXRoleAttribute), !skipped.contains(role),
+                let value: String = axAttr(node, kAXValueAttribute),
+                !value.trimmingCharacters(in: .whitespacesAndNewlines.union(["\u{FFFC}"])).isEmpty
+            else { continue }
+            let images = Detector.images(in: node)
+            return MessageSnapshot(
+                text: value, emojiLabels: images.map(\.label), emojiFrames: images.map { $0.frame ?? .zero },
+                field: axLabel(node), frame: axFrame(node))
+        }
+        return nil
+    }
+
+    /// The message focused in the conversation (Up from an empty composer focuses your last one):
+    /// its text and emoji, read from the whole message row, sender and time included.
+    func focusedMessage() -> (text: String, emojiLabels: [String])? {
+        guard let app, let focused = axElement(app, kAXFocusedUIElementAttribute),
+            (axAttr(focused, kAXRoleAttribute) as String?) != kAXTextAreaRole,
+            axAncestors(focused, limit: 4).dropFirst().contains(where: { (axAttr($0, kAXRoleAttribute) as String?) == kAXListRole })
+        else { return nil }
+        var texts: [String] = []
+        var labels: [String] = []
+        var stack: [(AXUIElement, Int)] = [(focused, 0)]
+        var visited = 0
+        while let (element, depth) = stack.popLast(), visited < 300 {
+            visited += 1
+            let role: String? = axAttr(element, kAXRoleAttribute)
+            if role == kAXImageRole {
+                labels.append(axLabel(element))
+            } else if role == kAXStaticTextRole, let value: String = axAttr(element, kAXValueAttribute) {
+                texts.append(value)
+            }
+            if depth < 12 { stack.append(contentsOf: axChildren(element).reversed().map { ($0, depth + 1) }) }
+        }
+        return (texts.joined(separator: " "), labels)
+    }
+
+    /// The focused element's role chain, nearest first, for diagnostics.
+    func focusedRoles() -> String {
+        guard let app, let focused = axElement(app, kAXFocusedUIElementAttribute) else { return "nothing focused" }
+        return axAncestors(focused, limit: 8).map { (axAttr($0, kAXRoleAttribute) as String?) ?? "?" }.joined(separator: " < ")
     }
 
     /// The bagel currently in Slack's focused field, if any.
@@ -451,6 +510,11 @@ final class SlackWatcher {
     func check(source: String) {
         guard Settings.armed else { return }
         let observation = observeFocused()
+        if case .bagel = observation {
+            lastContent = nil  // being dealt with; its clearing isn't a send
+        } else {
+            noteContent()
+        }
         if case .approaching = observation {
             lastSightingDate = Date()
             if !reportedApproach { onApproach?() }
@@ -467,24 +531,78 @@ final class SlackWatcher {
             if reported != nil, let last = lastSightingDate, Date().timeIntervalSince(last) > 2 {
                 reported = nil
             }
-            noteContent()
         }
     }
 
-    /// Hands the message box to Jev once its content has been still for a moment.
+    /// Tracks the message box to spot sends, and has new emoji in it judged by picture.
     private func noteContent() {
-        guard onContentSettled != nil, let snapshot = messageSnapshot(), !snapshot.isEmpty else {
-            lastContentKey = nil
-            settleTimer?.invalidate()
+        guard let snapshot = messageSnapshot() else {
+            lastContent = nil
             return
         }
-        guard snapshot.key != lastContentKey else { return }
-        lastContentKey = snapshot.key
-        settleTimer?.invalidate()
-        settleTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
-            guard let self, let now = self.messageSnapshot(), now.key == snapshot.key else { return }
-            self.onContentSettled?(now)
+        if !snapshot.isEmpty {
+            lastContent = snapshot
+            let emoji = zip(snapshot.emojiLabels, snapshot.emojiFrames).map { (label: $0, frame: $1) }
+            EmojiBook.shared.learn(emoji) { [weak self] bagels in
+                if !bagels.isEmpty { self?.check(source: "emoji book") }
+            }
+            return
         }
+        guard let sent = lastContent, sent.field == snapshot.field else { return }
+        lastContent = nil
+        // Confirm a moment later, so a flicker in Slack's tree isn't taken for a send.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, self.lastContent == nil, self.messageSnapshot()?.isEmpty != false else { return }
+            self.onSent?(sent)
+        }
+    }
+
+    /// Has the emoji on screen in Slack judged in the background, so an emoji seen before (in
+    /// someone's message, say) is already known when it's typed.
+    func startEmojiScan() {
+        emojiScanTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+            guard let self, Settings.armed, self.slackIsFrontmost else { return }
+            let visible = self.visibleEmoji().filter { !EmojiBook.shared.isKnown($0.label) }
+            if !visible.isEmpty { EmojiBook.shared.learn(visible) }
+        }
+    }
+
+    private func visibleEmoji() -> [(label: String, frame: CGRect)] {
+        guard let app, let window = axElement(app, kAXFocusedWindowAttribute) else { return [] }
+        var found: [(label: String, frame: CGRect)] = []
+        var stack = [window]
+        var visited = 0
+        while let element = stack.popLast(), visited < 2500 {
+            visited += 1
+            if (axAttr(element, kAXRoleAttribute) as String?) == kAXImageRole {
+                let label = axLabel(element)
+                if label.hasSuffix(" emoji"), !label.lowercased().contains("bagel"),
+                    let frame = axFrame(element), frame.width >= 16, frame.height >= 16
+                {
+                    found.append((label, frame))
+                }
+            }
+            stack.append(contentsOf: axChildren(element))
+        }
+        return found
+    }
+
+    /// Presses the button with this label in Slack's focused window, e.g. a dialog's "Delete".
+    func pressButton(named name: String) -> Bool {
+        guard let app, let window = axElement(app, kAXFocusedWindowAttribute) else { return false }
+        var queue = [window]
+        var visited = 0
+        while !queue.isEmpty, visited < 3000 {
+            let element = queue.removeFirst()
+            visited += 1
+            if (axAttr(element, kAXRoleAttribute) as String?) == kAXButtonRole,
+                axLabel(element).caseInsensitiveCompare(name) == .orderedSame
+            {
+                return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+            }
+            queue.append(contentsOf: axChildren(element))
+        }
+        return false
     }
 
     /// Report a bagel still in the box again, e.g. after the overlay closes without it being cleared.
@@ -495,19 +613,19 @@ final class SlackWatcher {
 
 // MARK: - Send interception (event tap)
 
+/// Marks keystrokes and clicks BagelGuard posts itself (replayed sends, the delete sequence), so the
+/// event tap lets them through.
+let syntheticEventMarker: Int64 = 0x6261_6765_6C
+
 /// Swallows Return and clicks on Slack's Send button while a bagel is in the message box. This is
 /// a backstop: detection normally clears the box first. While any app holds Secure Keyboard Entry
-/// the tap receives no keystrokes, so only the Send-button check works then.
+/// the tap receives no keystrokes, so only the Send-button check works then. (macOS sometimes
+/// leaves the login window holding it after a screen unlock; sends are then caught after the fact.)
 final class SendInterceptor {
     private var tap: CFMachPort?
     let watcher: SlackWatcher
     let jev: JevGuard
     var onBlocked: ((Hit, String) -> Void)?
-    /// A send held while Jev looks at the message.
-    private var holding = false
-    /// Marks the Return or click replayed after Jev clears a held send, so the tap lets it through.
-    private static let replayMarker: Int64 = 0x6261_6765_6C
-
     init(watcher: SlackWatcher, jev: JevGuard) {
         self.watcher = watcher
         self.jev = jev
@@ -537,7 +655,7 @@ final class SendInterceptor {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return pass
         }
-        guard event.getIntegerValueField(.eventSourceUserData) != Self.replayMarker else { return pass }
+        guard event.getIntegerValueField(.eventSourceUserData) != syntheticEventMarker else { return pass }
         guard Settings.armed, Settings.action != .log, let slackPid = watcher.pid else { return pass }
 
         if type == .keyDown {
@@ -555,10 +673,6 @@ final class SendInterceptor {
                 onBlocked?(stale, "return key (recent sighting)")
                 return nil
             }
-            // Shift-Return is a new line, not a send.
-            if !event.flags.contains(.maskShift), jevHolds(source: "return key", replay: Self.replayReturn) {
-                return nil
-            }
             return pass
         }
 
@@ -574,57 +688,8 @@ final class SendInterceptor {
                 onBlocked?(stale, "send button (recent sighting)")
                 return nil
             }
-            let location = event.location
-            if jevHolds(source: "send button", replay: { Self.replayClick(at: location) }) {
-                return nil
-            }
         }
         return pass
-    }
-
-    /// Whether to hold this send for Jev. A verdict from while typing answers at once; otherwise
-    /// the send waits for Jev and is replayed if the message is fine. Jev being unreachable for 3
-    /// seconds lets the send go, so a network outage doesn't stop Slack working.
-    private func jevHolds(source: String, replay: @escaping () -> Void) -> Bool {
-        guard jev.isAvailable, let snapshot = watcher.messageSnapshot(), !snapshot.isEmpty else { return false }
-        if holding { return true }
-        if let verdict = jev.cached(snapshot.key) {
-            guard verdict.intercepts else { return false }
-            onBlocked?(Hit(evidence: .jev(verdict.reason), field: snapshot.field), "\(source) (jev)")
-            return true
-        }
-        holding = true
-        var settled = false
-        let finish: (JevVerdict?) -> Void = { [weak self] verdict in
-            guard let self, !settled else { return }
-            settled = true
-            self.holding = false
-            if let verdict, verdict.intercepts {
-                self.onBlocked?(Hit(evidence: .jev(verdict.reason), field: snapshot.field), "\(source) (jev, held)")
-            } else if self.watcher.slackIsFrontmost, self.watcher.messageSnapshot()?.key == snapshot.key {
-                if verdict == nil { Log.write("jev: no verdict in time; letting the send through") }
-                replay()
-            }
-        }
-        jev.screen(snapshot, completion: finish)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { finish(nil) }
-        return true
-    }
-
-    private static func replayReturn() {
-        for down in [true, false] {
-            let event = CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(kVK_Return), keyDown: down)
-            event?.setIntegerValueField(.eventSourceUserData, value: replayMarker)
-            event?.post(tap: .cghidEventTap)
-        }
-    }
-
-    private static func replayClick(at point: CGPoint) {
-        for type in [CGEventType.leftMouseDown, .leftMouseUp] {
-            let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: .left)
-            event?.setIntegerValueField(.eventSourceUserData, value: replayMarker)
-            event?.post(tap: .cghidEventTap)
-        }
     }
 
     /// The pid owning the window under the pointer, from the window server: cheap, and it keeps
@@ -658,6 +723,79 @@ enum Responder {
         press(kVK_Delete)
     }
 
+    /// Deletes your last message in the focused conversation through Slack's own UI, since there's
+    /// no Slack token to call chat.delete with: Up edits the last message, saving it empty asks to
+    /// delete it, and the dialog's Delete confirms. Leaves it alone unless the message opened for
+    /// editing holds what was flagged.
+    static func deleteLastMessage(matching expected: MessageSnapshot, watcher: SlackWatcher, done: @escaping (Bool) -> Void) {
+        guard watcher.slackIsFrontmost, watcher.messageSnapshot()?.isEmpty == true else { return done(false) }
+        press(kVK_UpArrow)
+        // Depending on Slack's settings, Up either focuses your last message or opens it for editing.
+        poll(every: 0.1, upTo: 1.5, until: { watcher.focusedMessage() != nil || watcher.focusedTextSnapshot() != nil }) { found in
+            if let message = watcher.focusedMessage() {
+                guard contains(message, expected) else {
+                    Log.write("delete: focused message (\(message.text.count) chars, emoji \(message.emojiLabels)) isn't the flagged one (\(expected.text.count) chars, emoji \(expected.emojiLabels)); leaving it")
+                    press(kVK_Escape)
+                    return done(false)
+                }
+                // Delete on a focused message is Slack's delete shortcut; it asks to confirm.
+                press(kVK_Delete)
+                return confirmDelete(watcher: watcher, done: done)
+            }
+            if let editing = watcher.focusedTextSnapshot(), editing.sameContent(as: expected) {
+                // Saving an emptied edit asks to delete.
+                press(kVK_ANSI_A, .maskCommand)
+                press(kVK_Delete)
+                return after(0.2) {
+                    press(kVK_Return)
+                    confirmDelete(watcher: watcher, done: done)
+                }
+            }
+            Log.write("delete: after Up, focus is \(watcher.focusedRoles()); leaving it")
+            if found { press(kVK_Escape) }
+            done(false)
+        }
+    }
+
+    /// Whether a focused message row holds the flagged text and emoji (the row adds the sender,
+    /// time and status emoji around them).
+    private static func contains(_ message: (text: String, emojiLabels: [String]), _ expected: MessageSnapshot) -> Bool {
+        func normal(_ s: String) -> String { s.filter { !$0.isWhitespace && $0 != "\u{FFFC}" }.lowercased() }
+        let wanted = normal(expected.text)
+        return (wanted.isEmpty || normal(message.text).contains(wanted))
+            && Set(expected.emojiLabels).isSubset(of: Set(message.emojiLabels))
+            && !(wanted.isEmpty && expected.emojiLabels.isEmpty)
+    }
+
+    /// Presses Delete in Slack's confirmation dialog once it shows.
+    private static func confirmDelete(watcher: SlackWatcher, done: @escaping (Bool) -> Void) {
+        poll(every: 0.15, upTo: 2, until: { watcher.pressButton(named: "Delete") }) { pressed in
+            if !pressed {
+                Log.write("delete: no Delete button found; pressing Return")
+                press(kVK_Return)
+            }
+            after(0.4) {
+                press(kVK_Escape)  // focus back to the composer
+                done(true)
+            }
+        }
+    }
+
+    /// Checks `condition` every `interval` until it holds or `limit` seconds pass.
+    private static func poll(every interval: Double, upTo limit: Double, until condition: @escaping () -> Bool, then: @escaping (Bool) -> Void) {
+        let started = Date()
+        Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { timer in
+            let met = condition()
+            guard met || Date().timeIntervalSince(started) > limit else { return }
+            timer.invalidate()
+            then(met)
+        }
+    }
+
+    private static func after(_ seconds: Double, _ work: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+
     static func lockScreen() {
         Log.write("locking screen")
         let path = "/System/Library/PrivateFrameworks/login.framework/Versions/Current/login"
@@ -675,6 +813,7 @@ enum Responder {
         for down in [true, false] {
             let event = CGEvent(keyboardEventSource: source, virtualKey: CGKeyCode(key), keyDown: down)
             event?.flags = flags
+            event?.setIntegerValueField(.eventSourceUserData, value: syntheticEventMarker)
             event?.post(tap: .cghidEventTap)
         }
     }
@@ -719,7 +858,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async { self?.trigger(hit, source: source, blockedSend: true) }
         }
         overlay.onClose = { [weak self] in self?.watcher.forgetReported() }
-        watcher.onContentSettled = { [weak self] snapshot in self?.screenWithJev(snapshot) }
+        watcher.onSent = { [weak self] sent in self?.judgeSent(sent) }
+        EmojiBook.shared.jev = jev
         jev.start()
 
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -738,6 +878,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func startGuards() {
         Log.write("Accessibility granted; armed=\(Settings.armed) action=\(Settings.action.rawValue)")
         watcher.start()
+        watcher.startEmojiScan()
         interceptor.start()
         refreshIcon()
         if Settings.mugshot {
@@ -748,14 +889,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if CommandLine.arguments.contains("--preview") { testOverlay() }
     }
 
-    func trigger(_ hit: Hit, source: String, blockedSend: Bool = false) {
+    /// `clearBox` is false for a message already sent: the box is empty, and focus may still be on
+    /// a message, where Cmd-A + Delete would ask to delete it.
+    func trigger(_ hit: Hit, source: String, blockedSend: Bool = false, clearBox: Bool = true) {
         guard !responding, !overlay.isShowing else { return }
         let detectedAt = Date()
         let action = Settings.action
         Log.write("BAGEL in \"\(hit.field)\": \(hit.evidence) (via \(source)\(blockedSend ? ", send blocked" : "")) -> \(action.rawValue)")
         guard action != .log else { return }
 
-        let clearing = watcher.slackIsFrontmost
+        let clearing = clearBox && watcher.slackIsFrontmost
         if clearing { Responder.clearFocusedField() }
         if Settings.mugshot && action.showsOverlay { overlay.startCamera() }
         responding = true
@@ -770,15 +913,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// Jev's check while typing: catches what the local rules can't name, such as a bagel emoji
-    /// uploaded under another name, before anyone presses Return.
-    func screenWithJev(_ snapshot: MessageSnapshot) {
+    /// Every sent message is checked after the fact: its emoji against the emoji book (one judged
+    /// just now may have missed the box), and its text by Jev. A flagged message is deleted, then
+    /// handled like any other catch.
+    func judgeSent(_ sent: MessageSnapshot) {
         guard Settings.armed else { return }
-        jev.screen(snapshot) { [weak self] verdict in
-            guard let self, let verdict, verdict.intercepts,
-                self.watcher.messageSnapshot()?.key == snapshot.key
-            else { return }
-            self.trigger(Hit(evidence: .jev(verdict.reason), field: snapshot.field), source: "jev")
+        let bagelEmoji = { sent.emojiLabels.first(where: EmojiBook.shared.looksLikeBagel) }
+        if let label = bagelEmoji() {
+            return flagSent(sent, .emoji("\(label), looks like a bagel"))
+        }
+        // The local rules again, in case the box was sent before a check saw it.
+        if let evidence = Detector.scan(sent.text, plainText: true) {
+            return flagSent(sent, evidence)
+        }
+        if sent.emojiLabels.contains(where: { !EmojiBook.shared.isJudged($0) }) {
+            // An emoji still being judged: look again once the answer is in.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                if let label = bagelEmoji() { self?.flagSent(sent, .emoji("\(label), looks like a bagel")) }
+            }
+        }
+        jev.judge(sent) { [weak self] verdict in
+            guard let verdict, verdict.intercepts else { return }
+            self?.flagSent(sent, .jev(verdict.reason))
+        }
+    }
+
+    private var lastFlagged: String?
+
+    private func flagSent(_ sent: MessageSnapshot, _ evidence: Evidence) {
+        guard lastFlagged != sent.key else { return }
+        lastFlagged = sent.key
+        let hit = Hit(evidence: evidence, field: sent.field)
+        Log.write("sent message flagged in \"\(hit.field)\" (\(evidence)); deleting it")
+        Responder.deleteLastMessage(matching: sent, watcher: watcher) { [weak self] deleted in
+            Log.write(deleted ? "deleted the flagged message" : "flagged message NOT deleted")
+            self?.trigger(hit, source: deleted ? "sent, then deleted" : "sent, not deleted", clearBox: false)
         }
     }
 

@@ -1,6 +1,6 @@
-// Jev (TypeSafe's System One model) as a second opinion on the message box: it sees the box as
+// Jev (TypeSafe's System One model) as a second opinion on every sent message: it sees the box as
 // rendered, so a bagel emoji uploaded under another name still looks like a bagel, and it reads the
-// text for anything a software engineer wouldn't send themselves.
+// text for anything a software engineer wouldn't send themselves. A flagged message is deleted.
 
 import Cocoa
 import ScreenCaptureKit
@@ -19,6 +19,15 @@ struct MessageSnapshot {
 
     /// Identifies the content, so a verdict is reused until the message changes.
     var key: String { ([text] + emojiLabels).joined(separator: "\u{1}") }
+
+    /// Whether `other` holds the same message, ignoring spacing and allowing for Slack adding or
+    /// dropping a little formatting when a message is opened for editing.
+    func sameContent(as other: MessageSnapshot) -> Bool {
+        func normal(_ s: String) -> String { s.filter { !$0.isWhitespace && $0 != "\u{FFFC}" }.lowercased() }
+        let mine = normal(text), theirs = normal(other.text)
+        let textMatches = mine == theirs || (!theirs.isEmpty && (mine.contains(theirs) || theirs.contains(mine)) && !mine.isEmpty)
+        return textMatches && Set(emojiLabels) == Set(other.emojiLabels)
+    }
 
     var isEmpty: Bool {
         emojiLabels.isEmpty && text.trimmingCharacters(in: .whitespacesAndNewlines.union(["\u{FFFC}"])).isEmpty
@@ -127,10 +136,45 @@ enum Jev {
                 ],
             ]
         }
+        let answers = try await ask(state: state, questions: questions, assets: assets, apiKey: apiKey)
+        guard let bagel = answers["bagel"], let impostor = answers["impostor"] else {
+            throw NSError(domain: "Jev", code: 0, userInfo: [NSLocalizedDescriptionKey: "missing answers"])
+        }
+        return JevVerdict(bagel: max(bagel, answers["bagel_emoji"] ?? 0), impostor: impostor)
+    }
+
+    /// For each emoji picture, the probability that it shows a bagel. One question per emoji in a
+    /// single request; the reference 🥯 sits in the state once for all of them.
+    static func bagelProbabilities(of pictures: [String: CGImage], apiKey: String) async throws -> [String: Double] {
+        guard let bagelPNG = referenceBagel else { return [:] }
+        let bagelRef = "bagel-\(UUID().uuidString)"
+        var assets: [String: Any] = [bagelRef: ["type": "image", "format": "png", "data_base64": bagelPNG.base64EncodedString()]]
+        var emoji: [String: String] = [:]
+        var questions: [String: Any] = [:]
+        for (index, (label, picture)) in pictures.enumerated() {
+            guard let data = png(fitted(enlarged(picture))) else { continue }
+            let ref = "emoji-\(UUID().uuidString)"
+            assets[ref] = ["type": "image", "format": "png", "data_base64": data.base64EncodedString()]
+            emoji["e\(index)"] = ref
+            questions[label] = [
+                "type": "noul",
+                "instructions": "Is the Slack emoji `emoji.e\(index)` a picture of a bagel, whatever it is called?",
+                "criteria": [
+                    "true": "It shows a bagel, like `reference_bagel`: a round bread roll with a hole in the middle, plain or topped with seeds, drawn or photographed.",
+                    "false": "It shows something else, including a doughnut, a ring or other round food.",
+                ],
+            ]
+        }
+        guard !questions.isEmpty else { return [:] }
+        return try await ask(state: ["reference_bagel": bagelRef, "emoji": emoji], questions: questions, assets: assets, apiKey: apiKey)
+    }
+
+    /// Sends one System One request and returns each Noul answer by question id.
+    private static func ask(state: [String: Any], questions: [String: Any], assets: [String: Any], apiKey: String) async throws -> [String: Double] {
         var body: [String: Any] = ["model": model, "state": state, "questions": questions]
         if !assets.isEmpty { body["assets"] = assets }
 
-        var request = URLRequest(url: endpoint, timeoutInterval: 5)
+        var request = URLRequest(url: endpoint, timeoutInterval: 8)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -141,14 +185,11 @@ enum Jev {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200,
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let answers = json["answers"] as? [String: [String: Any]],
-            let bagel = (answers["bagel"]?["noul"] as? NSNumber)?.doubleValue,
-            let impostor = (answers["impostor"]?["noul"] as? NSNumber)?.doubleValue
+            let answers = json["answers"] as? [String: [String: Any]]
         else {
             throw NSError(domain: "Jev", code: status, userInfo: [NSLocalizedDescriptionKey: String(decoding: data.prefix(300), as: UTF8.self)])
         }
-        let bagelEmoji = (answers["bagel_emoji"]?["noul"] as? NSNumber)?.doubleValue ?? 0
-        return JevVerdict(bagel: max(bagel, bagelEmoji), impostor: impostor)
+        return answers.compactMapValues { ($0["noul"] as? NSNumber)?.doubleValue }
     }
 
     // MARK: Images
@@ -241,13 +282,9 @@ enum Jev {
     }
 }
 
-/// Screens message box contents with Jev, caching one verdict per content so the send check can
-/// usually answer straight away from the check made while typing.
+/// Judges sent messages with Jev.
 final class JevGuard {
-    private var apiKey: String?
-    private var cache: [String: JevVerdict] = [:]
-    private var cacheOrder: [String] = []
-    private var waiters: [String: [(JevVerdict?) -> Void]] = [:]
+    private(set) var apiKey: String?
 
     var isAvailable: Bool { apiKey != nil }
 
@@ -260,48 +297,105 @@ final class JevGuard {
             }
         }
         if !CGPreflightScreenCaptureAccess() {
-            Log.write("jev: no Screen Recording permission; judging text only")
+            Log.write("jev: no Screen Recording permission; emoji can't be judged by picture")
             CGRequestScreenCaptureAccess()
         }
     }
 
-    func cached(_ key: String) -> JevVerdict? { cache[key] }
-
-    /// Calls back on the main thread with the verdict, or nil if Jev couldn't be reached.
-    func screen(_ snapshot: MessageSnapshot, completion: @escaping (JevVerdict?) -> Void) {
+    /// Judges a sent message's text and emoji names. Calls back on the main thread with the
+    /// verdict, or nil if Jev couldn't be reached.
+    func judge(_ snapshot: MessageSnapshot, completion: @escaping (JevVerdict?) -> Void) {
         guard let apiKey, !snapshot.isEmpty else { return completion(nil) }
-        let key = snapshot.key
-        if let verdict = cache[key] { return completion(verdict) }
-        if waiters[key] != nil {
-            waiters[key]?.append(completion)
-            return
-        }
-        waiters[key] = [completion]
         Task {
             let started = Date()
             var verdict: JevVerdict?
-            let captured = snapshot.frame?.insetBy(dx: -6, dy: -6)
-            let image = if let captured { await Jev.capture(captured) } else { CGImage?.none }
-            let emoji = if let image, let captured { Jev.crops(of: snapshot.emojiFrames, from: image, captured: captured) } else { [CGImage]() }
             do {
-                verdict = try await Jev.judge(snapshot, boxImage: image, emojiImages: emoji, apiKey: apiKey)
+                verdict = try await Jev.judge(snapshot, boxImage: nil, apiKey: apiKey)
             } catch {
                 Log.write("jev: request failed: \(error.localizedDescription)")
             }
             let ms = Int(Date().timeIntervalSince(started) * 1000)
             DispatchQueue.main.async {
                 if let verdict {
-                    Log.write(String(format: "jev: bagel=%.2f impostor=%.2f image=%@ emoji=%d %dms", verdict.bagel, verdict.impostor, image == nil ? "no" : "yes", emoji.count, ms))
-                    self.remember(key, verdict)
+                    Log.write(String(format: "jev: sent message bagel=%.2f impostor=%.2f %dms", verdict.bagel, verdict.impostor, ms))
                 }
-                for waiter in self.waiters.removeValue(forKey: key) ?? [] { waiter(verdict) }
+                completion(verdict)
             }
         }
     }
+}
 
-    private func remember(_ key: String, _ verdict: JevVerdict) {
-        cache[key] = verdict
-        cacheOrder.append(key)
-        if cacheOrder.count > 64 { cache.removeValue(forKey: cacheOrder.removeFirst()) }
+/// Which emoji look like bagels, judged once per emoji name from its picture and remembered, so a
+/// bagel uploaded as `:legab:` is caught by name from then on, as fast as `:bagel:` is.
+final class EmojiBook {
+    static let shared = EmojiBook()
+    /// Emoji whose picture is at least this likely to be a bagel count as bagels for good, so it's
+    /// stricter than the per-message threshold.
+    static let threshold = 0.5
+    private let defaultsKey = "emojiBagelProbability"
+    private var probabilities: [String: Double]
+    private var pending: Set<String> = []
+    weak var jev: JevGuard?
+
+    private init() {
+        probabilities = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: Double] ?? [:]
+        rebuildNamesPattern()
+    }
+
+    func looksLikeBagel(_ label: String) -> Bool { (probabilities[label] ?? 0) >= Self.threshold }
+
+    func isJudged(_ label: String) -> Bool { probabilities[label] != nil }
+
+    /// Names of the emoji judged to be bagels, e.g. "legab" for "legab emoji".
+    var bagelNames: [String] {
+        probabilities.filter { $0.value >= Self.threshold }.keys
+            .map { $0.hasSuffix(" emoji") ? String($0.dropLast(6)) : $0 }.sorted()
+    }
+
+    /// Matches those names typed as words, however they're joined (Slack labels "heart-scale" as
+    /// "heart scale"). Rebuilt when the book changes; nil while no bagel emoji is known.
+    private(set) var namesPattern: NSRegularExpression?
+
+    private func rebuildNamesPattern() {
+        let names = bagelNames.map { name in
+            name.split(separator: " ").map { NSRegularExpression.escapedPattern(for: String($0)) }.joined(separator: "[ _-]?")
+        }
+        namesPattern = names.isEmpty ? nil : try? NSRegularExpression(pattern: "\\b(" + names.joined(separator: "|") + ")\\b", options: [.caseInsensitive])
+    }
+
+    func isKnown(_ label: String) -> Bool { probabilities[label] != nil || pending.contains(label) }
+
+    /// Judges the emoji not seen before, from where they are on screen. Calls `learned` on the main
+    /// thread with the labels that turned out to be bagels.
+    func learn(_ emoji: [(label: String, frame: CGRect)], learned: (([String]) -> Void)? = nil) {
+        guard let apiKey = jev?.apiKey, CGPreflightScreenCaptureAccess() else { return }
+        var unseen: [String: CGRect] = [:]
+        for item in emoji where !isKnown(item.label) && !item.label.isEmpty && item.frame.width >= 12 {
+            unseen[item.label] = item.frame
+        }
+        guard !unseen.isEmpty else { return }
+        let batch = Dictionary(uniqueKeysWithValues: unseen.prefix(8).map { ($0.key, $0.value) })
+        pending.formUnion(batch.keys)
+        Task {
+            var pictures: [String: CGImage] = [:]
+            for (label, frame) in batch {
+                if let image = await Jev.capture(frame) { pictures[label] = image }
+            }
+            var answers: [String: Double] = [:]
+            do {
+                answers = try await Jev.bagelProbabilities(of: pictures, apiKey: apiKey)
+            } catch {
+                Log.write("emoji book: request failed: \(error.localizedDescription)")
+            }
+            DispatchQueue.main.async {
+                self.pending.subtract(batch.keys)
+                for (label, probability) in answers { self.probabilities[label] = probability }
+                UserDefaults.standard.set(self.probabilities, forKey: self.defaultsKey)
+                self.rebuildNamesPattern()
+                let bagels = answers.filter { $0.value >= Self.threshold }.map(\.key).sorted()
+                Log.write("emoji book: judged \(answers.count) emoji\(bagels.isEmpty ? "" : ", bagels: \(bagels)")")
+                learned?(bagels)
+            }
+        }
     }
 }
