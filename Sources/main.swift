@@ -33,30 +33,36 @@ enum Action: String, CaseIterable {
     var showsOverlay: Bool { self == .overlayThenLock || self == .overlay }
 }
 
+/// Security-critical settings. These live in the signed `SecureStore`, not plain UserDefaults, so a
+/// `defaults write` can't disarm BagelGuard behind the Touch ID the menu requires. The counters that
+/// don't affect security (the case number) stay in ordinary defaults.
 enum Settings {
     static let defaults = UserDefaults.standard
 
     static func register() {
-        defaults.register(defaults: ["armed": true, "mugshot": true, "action": Action.overlayThenLock.rawValue])
+        SecureStore.boot()
+        if SecureStore.wasTampered {
+            Log.write("settings: signature mismatch — someone edited the store outside the app; failing closed to armed")
+        }
     }
 
     static var armed: Bool {
-        get { defaults.bool(forKey: "armed") }
-        set { defaults.set(newValue, forKey: "armed") }
+        get { SecureStore.bool("armed", default: true) }
+        set { SecureStore.set("armed", newValue) }
     }
 
     /// Whether the overlay takes a webcam photo of whoever tried.
     static var mugshot: Bool {
-        get { defaults.bool(forKey: "mugshot") }
-        set { defaults.set(newValue, forKey: "mugshot") }
+        get { SecureStore.bool("mugshot", default: true) }
+        set { SecureStore.set("mugshot", newValue) }
     }
 
     static var action: Action {
-        get { Action(rawValue: defaults.string(forKey: "action") ?? "") ?? .overlayThenLock }
-        set { defaults.set(newValue.rawValue, forKey: "action") }
+        get { Action(rawValue: SecureStore.string("action") ?? "") ?? .overlayThenLock }
+        set { SecureStore.set("action", newValue.rawValue) }
     }
 
-    /// Counts caught attempts; shown as the case number on the overlay.
+    /// Counts caught attempts; shown as the case number on the overlay. Not security-critical.
     static func nextCaseNumber() -> Int {
         let next = defaults.integer(forKey: "caseCount") + 1
         defaults.set(next, forKey: "caseCount")
@@ -66,13 +72,18 @@ enum Settings {
     /// Turning any safeguard off is a pause: it turns itself back on after this long.
     static let reengageAfter: TimeInterval = 3 * 60
 
-    /// When a turned-off safeguard comes back on. Persisted so a relaunch doesn't extend the pause.
+    /// When a turned-off safeguard comes back on. Persisted (signed) so a relaunch doesn't extend the
+    /// pause, and clamped on read to at most `reengageAfter` from now, so a pre-planted far-future
+    /// date can't keep a safeguard off.
     static func reengageAt(_ safeguard: Safeguard) -> Date? {
-        defaults.object(forKey: "reengageAt.\(safeguard.rawValue)") as? Date
+        guard let epoch = SecureStore.double("reengageAt.\(safeguard.rawValue)") else { return nil }
+        let date = Date(timeIntervalSince1970: epoch)
+        let cap = Date().addingTimeInterval(reengageAfter)
+        return min(date, cap)
     }
 
     static func setReengageAt(_ safeguard: Safeguard, _ date: Date?) {
-        defaults.set(date, forKey: "reengageAt.\(safeguard.rawValue)")
+        SecureStore.set("reengageAt.\(safeguard.rawValue)", date?.timeIntervalSince1970)
     }
 }
 
@@ -151,6 +162,12 @@ enum OwnerCheck {
     }
 }
 
+/// Whether the login window is covering the session (screen locked).
+func screenIsLocked() -> Bool {
+    guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+    return session["CGSSessionScreenIsLocked"] as? Bool ?? false
+}
+
 // MARK: - Accessibility helpers
 
 /// Caps accessibility calls, so a hung app can't stall the event tap. Clicks hit-test whatever app
@@ -218,6 +235,8 @@ enum Evidence: Equatable, CustomStringConvertible {
     case emoji(String)
     /// Jev's judgment of the box as rendered and its text, e.g. "looks like a bagel (Jev 93%)".
     case jev(String)
+    /// The face at the camera when sending, e.g. "face is Jane Doe, not Thomas Ip".
+    case face(String)
 
     var description: String {
         switch self {
@@ -226,6 +245,7 @@ enum Evidence: Equatable, CustomStringConvertible {
         case .word(let text): return "text \"\(text)\""
         case .emoji(let label): return "emoji image \"\(label)\""
         case .jev(let reason): return "jev: \(reason)"
+        case .face(let reason): return "face check: \(reason)"
         }
     }
 
@@ -237,6 +257,7 @@ enum Evidence: Equatable, CustomStringConvertible {
         case .word(let text): return "the word \"\(text)\""
         case .emoji(let label): return label
         case .jev(let reason): return reason
+        case .face(let reason): return reason
         }
     }
 }
@@ -281,9 +302,13 @@ enum Detector {
 
     static func scan(_ text: String, plainText: Bool) -> Evidence? {
         if text.contains("\u{1F96F}") { return .character }
-        if let match = first(shortcode, in: text) { return .shortcode(match) }
-        if plainText, let match = first(word, in: text) { return .word(match) }
-        if plainText, let match = first(EmojiBook.shared.namesPattern, in: text) { return .word(match) }
+        // Run the regexes on the normalized text too, so lookalike letters and spacing don't dodge them.
+        let normal = Text.normalized(text)
+        if let match = first(shortcode, in: text) ?? first(shortcode, in: normal) { return .shortcode(match) }
+        guard plainText else { return nil }
+        if let match = first(word, in: text) ?? first(word, in: normal) { return .word(match) }
+        if let match = first(EmojiBook.shared.namesPattern, in: text) { return .word(match) }
+        if let found = Text.hiddenBagel(in: text) { return .word(found) }
         return nil
     }
 
@@ -311,6 +336,17 @@ enum Detector {
             if depth < 8 { stack.append(contentsOf: axChildren(element).reversed().map { ($0, depth + 1) }) }
         }
         return found
+    }
+
+    /// A bagel in a message's text or emoji labels, wherever that text came from (the composer, an
+    /// edit box, or a message already sent).
+    static func evidence(text: String, emojiLabels: [String], plainText: Bool) -> Evidence? {
+        if let found = scan(text, plainText: plainText) { return found }
+        for label in emojiLabels {
+            if label.lowercased().contains("bagel") { return .emoji(label) }
+            if EmojiBook.shared.looksLikeBagel(label) { return .emoji("\(label), looks like a bagel") }
+        }
+        return nil
     }
 
     /// The message box (a text area) the focused node sits in, if any.
@@ -343,9 +379,13 @@ final class SlackWatcher {
     private(set) var lastSightingDate: Date?
     /// A message went out: the box went from holding this to empty. Seen from Slack's own tree, so
     /// it works when the event tap is blind (Secure Keyboard Entry stuck on after a screen lock).
-    var onSent: ((MessageSnapshot) -> Void)?
+    var onSent: ((MessageSnapshot, Date) -> Void)?
+    /// Whether Slack is in front (and the screen unlocked), on every poll.
+    var onSlackActive: ((Bool) -> Void)?
     /// What the focused message box last held, while it held anything.
     private var lastContent: MessageSnapshot?
+    /// When `lastContent` was last seen in the box: the send happened just after.
+    private var lastContentAt = Date.distantPast
     private var emojiScanTimer: Timer?
     var onHit: ((Hit, String) -> Void)?
     var onApproach: (() -> Void)?
@@ -373,7 +413,13 @@ final class SlackWatcher {
         }
         // Chromium doesn't post an AX notification for every edit, so also poll while Slack is in front.
         let timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            guard let self, let pid = self.pid, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return }
+            guard let self, let pid = self.pid, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+                !screenIsLocked()
+            else {
+                self?.onSlackActive?(false)
+                return
+            }
+            self.onSlackActive?(Settings.armed)
             self.check(source: "poll")
         }
         timer.tolerance = 0.05
@@ -509,7 +555,14 @@ final class SlackWatcher {
 
     func check(source: String) {
         guard Settings.armed else { return }
-        let observation = observeFocused()
+        var observation = observeFocused()
+        // Editing a message already sent (Up, then retype) happens in Slack's inline editor, which
+        // isn't the composer text area, so `observe` misses it. Scan that editor too.
+        if case .clean = observation, messageSnapshot() == nil, let editing = focusedTextSnapshot(),
+            let evidence = Detector.evidence(text: editing.text, emojiLabels: editing.emojiLabels, plainText: true)
+        {
+            observation = .bagel(Hit(evidence: evidence, field: editing.field))
+        }
         if case .bagel = observation {
             lastContent = nil  // being dealt with; its clearing isn't a send
         } else {
@@ -542,6 +595,7 @@ final class SlackWatcher {
         }
         if !snapshot.isEmpty {
             lastContent = snapshot
+            lastContentAt = Date()
             let emoji = zip(snapshot.emojiLabels, snapshot.emojiFrames).map { (label: $0, frame: $1) }
             EmojiBook.shared.learn(emoji) { [weak self] bagels in
                 if !bagels.isEmpty { self?.check(source: "emoji book") }
@@ -549,11 +603,12 @@ final class SlackWatcher {
             return
         }
         guard let sent = lastContent, sent.field == snapshot.field else { return }
+        let sentAt = lastContentAt
         lastContent = nil
         // Confirm a moment later, so a flicker in Slack's tree isn't taken for a send.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             guard let self, self.lastContent == nil, self.messageSnapshot()?.isEmpty != false else { return }
-            self.onSent?(sent)
+            self.onSent?(sent, sentAt)
         }
     }
 
@@ -626,6 +681,8 @@ final class SendInterceptor {
     let watcher: SlackWatcher
     let jev: JevGuard
     var onBlocked: ((Hit, String) -> Void)?
+    /// Why the person at the keyboard may not send, or nil if they may (the face check).
+    var sendRefusal: (() -> String?)?
     init(watcher: SlackWatcher, jev: JevGuard) {
         self.watcher = watcher
         self.jev = jev
@@ -673,6 +730,11 @@ final class SendInterceptor {
                 onBlocked?(stale, "return key (recent sighting)")
                 return nil
             }
+            // Shift-Return is a new line, not a send.
+            if !event.flags.contains(.maskShift), let hit = refusedSend() {
+                onBlocked?(hit, "return key")
+                return nil
+            }
             return pass
         }
 
@@ -688,8 +750,20 @@ final class SendInterceptor {
                 onBlocked?(stale, "send button (recent sighting)")
                 return nil
             }
+            if let hit = refusedSend() {
+                onBlocked?(hit, "send button")
+                return nil
+            }
         }
         return pass
+    }
+
+    /// A send from the composer, or a save of an edited message, with something in it, by someone the
+    /// face check doesn't pass.
+    private func refusedSend() -> Hit? {
+        guard let snapshot = watcher.messageSnapshot() ?? watcher.focusedTextSnapshot(), !snapshot.isEmpty,
+            let refusal = sendRefusal?() else { return nil }
+        return Hit(evidence: .face(refusal), field: snapshot.field)
     }
 
     /// The pid owning the window under the pointer, from the window server: cheap, and it keeps
@@ -732,15 +806,11 @@ enum Responder {
         press(kVK_UpArrow)
         // Depending on Slack's settings, Up either focuses your last message or opens it for editing.
         poll(every: 0.1, upTo: 1.5, until: { watcher.focusedMessage() != nil || watcher.focusedTextSnapshot() != nil }) { found in
-            if let message = watcher.focusedMessage() {
-                guard contains(message, expected) else {
-                    Log.write("delete: focused message (\(message.text.count) chars, emoji \(message.emojiLabels)) isn't the flagged one (\(expected.text.count) chars, emoji \(expected.emojiLabels)); leaving it")
-                    press(kVK_Escape)
-                    return done(false)
-                }
-                // Delete on a focused message is Slack's delete shortcut; it asks to confirm.
-                press(kVK_Delete)
-                return confirmDelete(watcher: watcher, done: done)
+            if watcher.focusedMessage() != nil {
+                // A later message may have been sent right after (the "send, then lgtm" dodge), so
+                // the flagged one isn't necessarily the one Up focused. Walk up recent messages,
+                // newest first, until it's found.
+                return searchUpward(matching: expected, watcher: watcher, remaining: 6, done: done)
             }
             if let editing = watcher.focusedTextSnapshot(), editing.sameContent(as: expected) {
                 // Saving an emptied edit asks to delete.
@@ -754,6 +824,28 @@ enum Responder {
             Log.write("delete: after Up, focus is \(watcher.focusedRoles()); leaving it")
             if found { press(kVK_Escape) }
             done(false)
+        }
+    }
+
+    /// With a message focused, deletes it if it's the flagged one, else moves up to the previous
+    /// message and tries again, up to `remaining` times.
+    private static func searchUpward(matching expected: MessageSnapshot, watcher: SlackWatcher, remaining: Int, done: @escaping (Bool) -> Void) {
+        guard let message = watcher.focusedMessage() else {
+            press(kVK_Escape)
+            return done(false)
+        }
+        if contains(message, expected) {
+            press(kVK_Delete)  // Slack's delete shortcut on a focused message; it asks to confirm
+            return confirmDelete(watcher: watcher, done: done)
+        }
+        guard remaining > 0 else {
+            Log.write("delete: flagged message (\(expected.text.count) chars, emoji \(expected.emojiLabels)) not among recent messages; leaving it")
+            press(kVK_Escape)
+            return done(false)
+        }
+        press(kVK_UpArrow)  // move selection to the previous message
+        after(0.12) {
+            searchUpward(matching: expected, watcher: watcher, remaining: remaining - 1, done: done)
         }
     }
 
@@ -824,6 +916,7 @@ enum Responder {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let watcher = SlackWatcher()
     let jev = JevGuard()
+    let faceWatch = FaceWatch()
     lazy var interceptor = SendInterceptor(watcher: watcher, jev: jev)
     let overlay = OverlayController()
     var statusItem: NSStatusItem!
@@ -858,7 +951,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async { self?.trigger(hit, source: source, blockedSend: true) }
         }
         overlay.onClose = { [weak self] in self?.watcher.forgetReported() }
-        watcher.onSent = { [weak self] sent in self?.judgeSent(sent) }
+        watcher.onSent = { [weak self] sent, sentAt in self?.judgeSent(sent, sentAt: sentAt) }
+        // The camera runs while Slack is in front, so the owner is already recognised by the time
+        // they click into a box and send.
+        watcher.onSlackActive = { [weak self] active in
+            guard let self else { return }
+            // The overlay's mugshot needs the camera; the watch resumes once it's gone.
+            if active, !self.responding, !self.overlay.isShowing {
+                self.faceWatch.start()
+            } else if screenIsLocked() {
+                self.faceWatch.stopNow()
+            } else if !active {
+                self.faceWatch.stop()
+            }
+        }
+        faceWatch.onStranger = { [weak self] name in self?.strangerAtKeyboard(name) }
+        interceptor.sendRefusal = { [weak self] in self?.faceWatch.refusalBeforeSend }
         EmojiBook.shared.jev = jev
         jev.start()
 
@@ -898,6 +1006,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Log.write("BAGEL in \"\(hit.field)\": \(hit.evidence) (via \(source)\(blockedSend ? ", send blocked" : "")) -> \(action.rawValue)")
         guard action != .log else { return }
 
+        if Settings.mugshot && action.showsOverlay { faceWatch.stopNow() }
         let clearing = clearBox && watcher.slackIsFrontmost
         if clearing { Responder.clearFocusedField() }
         if Settings.mugshot && action.showsOverlay { overlay.startCamera() }
@@ -916,8 +1025,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Every sent message is checked after the fact: its emoji against the emoji book (one judged
     /// just now may have missed the box), and its text by Jev. A flagged message is deleted, then
     /// handled like any other catch.
-    func judgeSent(_ sent: MessageSnapshot) {
+    func judgeSent(_ sent: MessageSnapshot, sentAt: Date) {
         guard Settings.armed else { return }
+        faceWatch.verdict(forSendAt: sentAt) { [weak self] refusal, summary in
+            guard let self else { return }
+            Log.write("face check on send: \(refusal ?? "passed") (\(summary))")
+            if let refusal { return self.flagSent(sent, .face(refusal)) }
+            self.judgeContent(sent)
+        }
+    }
+
+    private func judgeContent(_ sent: MessageSnapshot) {
         let bagelEmoji = { sent.emojiLabels.first(where: EmojiBook.shared.looksLikeBagel) }
         if let label = bagelEmoji() {
             return flagSent(sent, .emoji("\(label), looks like a bagel"))
@@ -932,10 +1050,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let label = bagelEmoji() { self?.flagSent(sent, .emoji("\(label), looks like a bagel")) }
             }
         }
-        jev.judge(sent) { [weak self] verdict in
-            guard let verdict, verdict.intercepts else { return }
-            self?.flagSent(sent, .jev(verdict.reason))
+        jev.judge(sent) { [weak self] outcome in
+            switch outcome {
+            case .verdict(let verdict):
+                if verdict.intercepts { self?.flagSent(sent, .jev(verdict.reason)) }
+            case .unreachable:
+                // The content filter is required but couldn't run: by "pass both checks", a message
+                // it couldn't clear doesn't go out. (Disarm with Touch ID to send while offline.)
+                self?.flagSent(sent, .jev("couldn't be screened (Jev unreachable)"))
+            case .off:
+                break  // no key configured: the Jev filter isn't set up
+            }
         }
+    }
+
+    /// Someone other than the owner is at the camera while a message is being written: deal with
+    /// it before they can send.
+    func strangerAtKeyboard(_ name: String?) {
+        guard Settings.armed, watcher.slackIsFrontmost, let snapshot = watcher.messageSnapshot(), !snapshot.isEmpty,
+            let refusal = faceWatch.refusalBeforeSend
+        else { return }
+        trigger(Hit(evidence: .face(refusal), field: snapshot.field), source: "face watch")
     }
 
     private var lastFlagged: String?
@@ -1014,11 +1149,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(actions)
         menu.addItem(checkbox: "Take a mugshot" + countdown(.mugshot), Settings.mugshot, #selector(toggleMugshot))
+        let enroll = Lineup.shared.isOwnerEnrolled ? "Re-enroll my face for sending" : "Enroll my face for sending…"
+        menu.addItem(NSMenuItem(title: enroll, action: #selector(enrollFace), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Preview overlay", action: #selector(testOverlay), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Open mugshots", action: #selector(openMugshots), keyEquivalent: ""))
         menu.addItem(.separator())
 
         menu.addItem(checkbox: "Start at login" + countdown(.loginItem), Safeguard.loginItem.isEngaged, #selector(toggleLoginItem))
+        menu.addItem(checkbox: "Relaunch if force-quit", WatchdogAgent.isInstalled, #selector(toggleWatchdog))
         menu.addItem(NSMenuItem(title: "Open log", action: #selector(openLog), keyEquivalent: ""))
         menu.addItem(.separator())
         let minutes = Int(Settings.reengageAfter / 60)
@@ -1091,6 +1229,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private var enrollCamera: MugshotCamera?
+
+    /// Captures one camera frame behind Touch ID and stores the owner's face embedding, so the face
+    /// check no longer depends on the swappable lineup photo file.
+    @objc func enrollFace() {
+        OwnerCheck.require("enrol your face as the owner") { [weak self] in
+            guard MugshotCamera.isAuthorized else { return self?.enrollResult(false, "Camera access is off.") ?? () }
+            self?.faceWatch.stopNow()  // free the camera
+            let cam = MugshotCamera()
+            self?.enrollCamera = cam
+            cam.snap(onPhoto: { [weak self] mugshot in
+                guard let image = mugshot?.rawImage ?? mugshot?.image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+                    return self?.enrollResult(false, "Couldn't get a camera frame.") ?? ()
+                }
+                Lineup.shared.enrollOwner(from: image) { [weak self] ok in
+                    self?.enrollCamera = nil
+                    self?.enrollResult(ok, ok ? "Your face is enrolled. Only you can send now." : "No clear face found — try again, facing the camera in good light.")
+                }
+            }, onAnalyzed: { _ in })
+        }
+    }
+
+    private func enrollResult(_ ok: Bool, _ message: String) {
+        Log.write("enroll: \(ok ? "ok" : "failed") — \(message)")
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = ok ? "Face enrolled" : "Enrollment didn't work"
+        alert.informativeText = message
+        alert.runModal()
+    }
+
     @objc func openMugshots() {
         try? FileManager.default.createDirectory(at: MugshotArchive.folder, withIntermediateDirectories: true)
         NSWorkspace.shared.open(MugshotArchive.folder)
@@ -1118,6 +1287,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     Log.write("login item change failed: \(error)")
                 }
             }
+        }
+    }
+
+    /// A LaunchAgent that brings BagelGuard back if someone force-quits it (`killall`, Activity
+    /// Monitor). Installing or removing it needs Touch ID, like any other weakening.
+    @objc func toggleWatchdog() {
+        let installed = WatchdogAgent.isInstalled
+        OwnerCheck.require(installed ? "stop BagelGuard relaunching itself" : "let BagelGuard relaunch itself if force-quit") {
+            installed ? WatchdogAgent.uninstall() : WatchdogAgent.install()
         }
     }
 

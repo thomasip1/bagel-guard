@@ -22,6 +22,11 @@ final class Lineup {
     private var model: MLModel?
     private let queue = DispatchQueue(label: "com.thomasip.bagelguard.lineup")
     private(set) var isReady = false
+    /// The owner's own face, enrolled behind Touch ID and held in the signed store, so swapping the
+    /// `Thomas Ip.jpg` file in the (user-writable) lineup folder can't make someone else the owner.
+    /// When set it is used for the owner check instead of the file.
+    private(set) var ownerEmbedding: [Float]?
+    var isOwnerEnrolled: Bool { ownerEmbedding != nil }
 
     // Standard 5-point reference for 112x112 aligned face (ArcFace/SFace convention).
     private static let refPoints: [(Double, Double)] = [
@@ -43,7 +48,34 @@ final class Lineup {
                 return
             }
             model = m
+            if let stored = SecureStore.dictionary("owner")?["embedding"] as? [Double] {
+                ownerEmbedding = stored.map { Float($0) }
+                Log.write("lineup: owner face enrolled (\(stored.count)-d)")
+            }
             reindex()
+        }
+    }
+
+    /// Embeds the face in `image` and stores it (signed) as the owner. Returns false if no clear
+    /// face is found. Call behind Touch ID.
+    func enrollOwner(from image: CGImage, completion: @escaping (Bool) -> Void) {
+        queue.async { [self] in
+            guard model != nil, let aligned = alignFace(in: image), let embedding = embed(aligned) else {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            ownerEmbedding = embedding
+            SecureStore.set("owner", ["embedding": embedding.map { Double($0) }])
+            Log.write("lineup: owner face enrolled (\(embedding.count)-d)")
+            DispatchQueue.main.async { completion(true) }
+        }
+    }
+
+    func clearOwnerEnrollment() {
+        queue.async { [self] in
+            ownerEmbedding = nil
+            SecureStore.set("owner", nil)
+            Log.write("lineup: owner enrollment cleared")
         }
     }
 
@@ -105,6 +137,30 @@ final class Lineup {
         Log.write("lineup: matched \(match.name) (similarity \(String(format: "%.3f", match.sim)))")
         return LineupMatch(name: match.name, similarity: match.sim)
     }
+
+    enum Check {
+        case noFace
+        /// How closely the face matches `owner`'s photo, and the best match above the threshold.
+        case face(ownerSimilarity: Double, best: LineupMatch?)
+    }
+
+    /// Like `identify`, but scores the face against one person in particular, and doesn't log: it
+    /// runs on camera frames several times a second.
+    func check(cgImage: CGImage, owner: String) -> Check {
+        guard isReady, let aligned = alignFace(in: cgImage), let query = embed(aligned) else { return .noFace }
+        // The owner comes from the enrolled embedding when there is one; the file entry is only a
+        // fallback for someone who hasn't enrolled.
+        var ownerSimilarity = ownerEmbedding.map { cosine(query, $0) } ?? -1.0
+        var best: (name: String, sim: Double)?
+        for entry in entries {
+            let sim = cosine(query, entry.embedding)
+            if ownerEmbedding == nil, entry.name == owner { ownerSimilarity = sim }
+            if sim > Self.threshold, sim > (best?.sim ?? -1) { best = (entry.name, sim) }
+        }
+        return .face(ownerSimilarity: ownerSimilarity, best: best.map { LineupMatch(name: $0.name, similarity: $0.sim) })
+    }
+
+    static var matchThreshold: Double { threshold }
 
     // MARK: - Face alignment
 

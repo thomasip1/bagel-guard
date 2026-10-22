@@ -44,9 +44,39 @@ Slack's own UI (Up focuses your last message, Delete, confirm), then handled lik
 Both work from Slack's accessibility tree, not keystrokes, so they keep working when macOS leaves
 Secure Keyboard Entry stuck on after a screen unlock (which blinds the Return backstop).
 
+The disguises Jev's text question is told to expect are also caught by the local rules before a send:
+lookalike letters ("bаgel" with a Cyrillic а), spacing ("b a g e l"), leetspeak ("b4g3l") and a few
+other languages (ベーグル, 贝果) all normalise to the bagel word. Jev is **fail-closed**: if it is set
+up but can't be reached (after a few retries), a message it couldn't screen is treated as not having
+passed and is pulled, so turn BagelGuard off (Touch ID) to chat while offline. Long messages are
+trimmed before being sent to Jev so a wall of text can't push the request over its limit.
+
 Needs `JEV_API_KEY`, either in the environment or set in your fish config (`set -gx JEV_API_KEY …`),
 and **Screen Recording** permission to see emoji pictures. Sent messages' text and emoji names, and
 pictures of emoji, are sent to TypeSafe's API.
+
+## Face check
+
+Every send also has to pass a face check: the message only goes out if your face was at the camera in
+the second or so around it. The camera runs while Slack is in front (and for a grace period after),
+each frame is matched against your enrolled face, and a send with a stranger's face — or no face —
+is pulled and shown on the overlay. **Enrol your face** from the menu ("Enrol my face for sending");
+it stores your face embedding in the signed store, so swapping the `Thomas Ip.jpg` file in the lineup
+folder can't make someone else the owner. Without enrolment it falls back to that file.
+
+## Hardening
+
+- **Settings are signed.** Armed, the catch action, the re-engage clocks and the emoji book live in a
+  blob signed with a key in the Keychain, not plain `defaults`, so `defaults write …` can't disarm
+  BagelGuard behind the Touch ID the menu requires. A tampered or deleted store fails closed to armed.
+- **Re-engage dates are capped** at three minutes from now on read, so a pre-planted far-future date
+  can't hold a safeguard off.
+- **Relaunch if force-quit.** A menu toggle (Touch ID) installs a LaunchAgent that brings BagelGuard
+  back if it's killed with `killall` or Activity Monitor, but not when you quit it cleanly. (A frozen
+  process, `kill -STOP`, isn't covered.)
+- **Editing a sent message** to insert a bagel is caught too, and saving an edit is face-gated.
+- **Deleting a flagged message** walks up recent messages to find it, so sending something innocent
+  right after the prank doesn't save the prank.
 
 Try a message without Slack:
 
