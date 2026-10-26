@@ -681,6 +681,9 @@ final class SendInterceptor {
     let watcher: SlackWatcher
     let jev: JevGuard
     var onBlocked: ((Hit, String) -> Void)?
+    /// A send just happened, with this content, seen at the keystroke (reliable even when a fast send
+    /// outruns the poll). The content is judged, and deleted if it's a bagel or doesn't pass.
+    var onSendAttempt: ((MessageSnapshot) -> Void)?
     /// Why the person at the keyboard may not send, or nil if they may (the face check).
     var sendRefusal: (() -> String?)?
     init(watcher: SlackWatcher, jev: JevGuard) {
@@ -731,9 +734,15 @@ final class SendInterceptor {
                 return nil
             }
             // Shift-Return is a new line, not a send.
-            if !event.flags.contains(.maskShift), let hit = refusedSend() {
+            guard !event.flags.contains(.maskShift) else { return pass }
+            if let hit = refusedSend() {
                 onBlocked?(hit, "return key")
                 return nil
+            }
+            // Capture the box now, at the keystroke, so even a send too fast for the 0.25 s poll to
+            // have seen gets judged (and deleted) afterwards.
+            if let snap = watcher.messageSnapshot() ?? watcher.focusedTextSnapshot(), !snap.isEmpty {
+                onSendAttempt?(snap)
             }
             return pass
         }
@@ -753,6 +762,9 @@ final class SendInterceptor {
             if let hit = refusedSend() {
                 onBlocked?(hit, "send button")
                 return nil
+            }
+            if let snap = watcher.messageSnapshot() ?? watcher.focusedTextSnapshot(), !snap.isEmpty {
+                onSendAttempt?(snap)
             }
         }
         return pass
@@ -952,6 +964,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         overlay.onClose = { [weak self] in self?.watcher.forgetReported() }
         watcher.onSent = { [weak self] sent, sentAt in self?.judgeSent(sent, sentAt: sentAt) }
+        // Fires from the event tap at the Return/Send keystroke, so a send too fast for the poll is
+        // still judged. Give Slack a moment to actually send, then run the same checks.
+        interceptor.onSendAttempt = { [weak self] sent in
+            let at = Date()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self?.judgeSent(sent, sentAt: at) }
+        }
         // The camera runs while Slack is in front, so the owner is already recognised by the time
         // they click into a box and send.
         watcher.onSlackActive = { [weak self] active in
@@ -1025,8 +1043,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Every sent message is checked after the fact: its emoji against the emoji book (one judged
     /// just now may have missed the box), and its text by Jev. A flagged message is deleted, then
     /// handled like any other catch.
+    private var recentlyJudged: [String: Date] = [:]
+
     func judgeSent(_ sent: MessageSnapshot, sentAt: Date) {
-        guard Settings.armed else { return }
+        guard Settings.armed, !sent.isEmpty else { return }
+        // The tap path and the poll path can both report one send; judge each content once per few seconds.
+        let now = Date()
+        recentlyJudged = recentlyJudged.filter { now.timeIntervalSince($0.value) < 3 }
+        if let last = recentlyJudged[sent.key], now.timeIntervalSince(last) < 3 { return }
+        recentlyJudged[sent.key] = now
         faceWatch.verdict(forSendAt: sentAt) { [weak self] refusal, summary in
             guard let self else { return }
             Log.write("face check on send: \(refusal ?? "passed") (\(summary))")
