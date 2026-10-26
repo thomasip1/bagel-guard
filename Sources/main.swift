@@ -839,6 +839,37 @@ enum Responder {
         }
     }
 
+    /// Deletes a bagel that was sent before detection could clear it: walks the most recent messages,
+    /// newest first, and removes the first one that is a bagel. Only touches bagel messages.
+    static func deleteJustSentBagel(watcher: SlackWatcher, done: @escaping (Bool) -> Void) {
+        guard watcher.slackIsFrontmost, watcher.messageSnapshot()?.isEmpty != false else { return done(false) }
+        press(kVK_UpArrow)
+        poll(every: 0.1, upTo: 1.5, until: { watcher.focusedMessage() != nil }) { found in
+            guard found else {
+                Log.write("delete sent bagel: no message focused after Up (\(watcher.focusedRoles()))")
+                return done(false)
+            }
+            deleteBagelUpward(watcher: watcher, remaining: 4, done: done)
+        }
+    }
+
+    private static func deleteBagelUpward(watcher: SlackWatcher, remaining: Int, done: @escaping (Bool) -> Void) {
+        guard let message = watcher.focusedMessage() else {
+            press(kVK_Escape)
+            return done(false)
+        }
+        if Detector.evidence(text: message.text, emojiLabels: message.emojiLabels, plainText: true) != nil {
+            press(kVK_Delete)
+            return confirmDelete(watcher: watcher, done: done)
+        }
+        guard remaining > 0 else {
+            press(kVK_Escape)
+            return done(false)
+        }
+        press(kVK_UpArrow)
+        after(0.12) { deleteBagelUpward(watcher: watcher, remaining: remaining - 1, done: done) }
+    }
+
     /// With a message focused, deletes it if it's the flagged one, else moves up to the previous
     /// message and tries again, up to `remaining` times.
     private static func searchUpward(matching expected: MessageSnapshot, watcher: SlackWatcher, remaining: Int, done: @escaping (Bool) -> Void) {
@@ -1019,11 +1050,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// a message, where Cmd-A + Delete would ask to delete it.
     func trigger(_ hit: Hit, source: String, blockedSend: Bool = false, clearBox: Bool = true) {
         guard !responding, !overlay.isShowing else { return }
-        let detectedAt = Date()
         let action = Settings.action
         Log.write("BAGEL in \"\(hit.field)\": \(hit.evidence) (via \(source)\(blockedSend ? ", send blocked" : "")) -> \(action.rawValue)")
         guard action != .log else { return }
 
+        // A bagel caught in the composer that is no longer there was sent a frame before we saw it
+        // (the AX notification arrived after the Return). Delete the sent copy, then respond.
+        let contentBagel: Bool = { if case .face = hit.evidence { return false } else { return true } }()
+        if clearBox, contentBagel, watcher.slackIsFrontmost, watcher.messageSnapshot()?.isEmpty != false {
+            responding = true
+            Log.write("bagel already left the box — deleting the sent copy")
+            Responder.deleteJustSentBagel(watcher: watcher) { [weak self] deleted in
+                Log.write(deleted ? "deleted the sent bagel" : "no sent bagel found among recent messages")
+                self?.responding = false
+                self?.respond(to: hit, action: action, clearBox: false)
+            }
+            return
+        }
+        respond(to: hit, action: action, clearBox: clearBox)
+    }
+
+    /// Clears the box (when the bagel is still in it), shows the overlay and locks.
+    func respond(to hit: Hit, action: Action, clearBox: Bool) {
+        guard !responding, !overlay.isShowing else { return }
+        let detectedAt = Date()
         if Settings.mugshot && action.showsOverlay { faceWatch.stopNow() }
         let clearing = clearBox && watcher.slackIsFrontmost
         if clearing { Responder.clearFocusedField() }
