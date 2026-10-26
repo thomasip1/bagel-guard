@@ -839,6 +839,14 @@ enum Responder {
         }
     }
 
+    /// Clears the composer, waits for it to empty, then deletes any bagel that had already been sent.
+    static func clearAndDeleteSentBagel(watcher: SlackWatcher, done: @escaping (Bool) -> Void) {
+        if watcher.messageSnapshot()?.isEmpty == false { clearFocusedField() }
+        poll(every: 0.05, upTo: 0.5, until: { watcher.messageSnapshot()?.isEmpty != false }) { _ in
+            deleteJustSentBagel(watcher: watcher, done: done)
+        }
+    }
+
     /// Deletes a bagel that was sent before detection could clear it: walks the most recent messages,
     /// newest first, and removes the first one that is a bagel. Only touches bagel messages.
     static func deleteJustSentBagel(watcher: SlackWatcher, done: @escaping (Bool) -> Void) {
@@ -1054,14 +1062,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Log.write("BAGEL in \"\(hit.field)\": \(hit.evidence) (via \(source)\(blockedSend ? ", send blocked" : "")) -> \(action.rawValue)")
         guard action != .log else { return }
 
-        // A bagel caught in the composer that is no longer there was sent a frame before we saw it
-        // (the AX notification arrived after the Return). Delete the sent copy, then respond.
+        // A bagel caught in the composer may already have been sent a frame before the AX
+        // notification reached us (the box can even still read non-empty from AX lag). So clear the
+        // box and, either way, delete any copy that already went out — the delete only removes a
+        // message that is itself a bagel, so it does nothing when nothing was sent.
         let contentBagel: Bool = { if case .face = hit.evidence { return false } else { return true } }()
-        if clearBox, contentBagel, watcher.slackIsFrontmost, watcher.messageSnapshot()?.isEmpty != false {
+        if clearBox, contentBagel, watcher.slackIsFrontmost {
             responding = true
-            Log.write("bagel already left the box — deleting the sent copy")
-            Responder.deleteJustSentBagel(watcher: watcher) { [weak self] deleted in
-                Log.write(deleted ? "deleted the sent bagel" : "no sent bagel found among recent messages")
+            Responder.clearAndDeleteSentBagel(watcher: watcher) { [weak self] deleted in
+                if deleted { Log.write("deleted a bagel that had already been sent") }
                 self?.responding = false
                 self?.respond(to: hit, action: action, clearBox: false)
             }
@@ -1096,7 +1105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var recentlyJudged: [String: Date] = [:]
 
     func judgeSent(_ sent: MessageSnapshot, sentAt: Date) {
-        guard Settings.armed, !sent.isEmpty else { return }
+        guard Settings.armed, !sent.isEmpty, !responding, !overlay.isShowing else { return }
         // The tap path and the poll path can both report one send; judge each content once per few seconds.
         let now = Date()
         recentlyJudged = recentlyJudged.filter { now.timeIntervalSince($0.value) < 3 }
@@ -1151,7 +1160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastFlagged: String?
 
     private func flagSent(_ sent: MessageSnapshot, _ evidence: Evidence) {
-        guard lastFlagged != sent.key else { return }
+        guard lastFlagged != sent.key, !responding, !overlay.isShowing else { return }
         lastFlagged = sent.key
         let hit = Hit(evidence: evidence, field: sent.field)
         Log.write("sent message flagged in \"\(hit.field)\" (\(evidence)); deleting it")
